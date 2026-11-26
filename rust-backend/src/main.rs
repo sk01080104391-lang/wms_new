@@ -1,0 +1,4709 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use axum::{
+    body::{to_bytes, Body},
+    extract::{Query, State},
+    http::{
+        header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderValue, Method, Request, StatusCode,
+    },
+    middleware::{self, Next},
+    routing::get,
+    Json, Router,
+};
+use chrono::{DateTime, Datelike, Utc};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use rand::RngCore;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
+use smartcore::{
+    ensemble::random_forest_regressor::{RandomForestRegressor, RandomForestRegressorParameters},
+    linalg::basic::matrix::DenseMatrix,
+};
+use std::{env, net::SocketAddr};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct AppState {
+    db: Option<PgPool>,
+    jwt_secret: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionClaims {
+    sub: String,
+    email: String,
+    role: String,
+    status: String,
+    warehouse_id: Option<String>,
+    exp: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedUser {
+    id: String,
+    email: String,
+    role: String,
+    status: String,
+    warehouse_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    database: &'static str,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct InventoryItem {
+    id: Uuid,
+    #[serde(rename = "warehouseId")]
+    warehouse_id: String,
+    name: String,
+    barcode: Option<String>,
+    current: Decimal,
+    safe: Decimal,
+    #[serde(rename = "safetyStockMode")]
+    safety_stock_mode: String,
+    #[serde(rename = "safetyStockPrompted")]
+    safety_stock_prompted: bool,
+    #[serde(rename = "safetyStockLeadTimeDays")]
+    safety_stock_lead_time_days: i32,
+    #[serde(rename = "safetyStockServiceLevel")]
+    safety_stock_service_level: Decimal,
+    unit: String,
+    #[serde(rename = "packageUnit")]
+    package_unit: Option<String>,
+    #[serde(rename = "packageSize")]
+    package_size: Decimal,
+    #[serde(rename = "palletUnit")]
+    pallet_unit: Option<String>,
+    #[serde(rename = "palletSize")]
+    pallet_size: Decimal,
+    status: String,
+    #[serde(rename = "statusLabel")]
+    status_label: String,
+    #[serde(rename = "diffText")]
+    diff_text: String,
+    recommendation: String,
+    cycle: String,
+    date: Option<chrono::NaiveDate>,
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct InventoryQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateInventoryItem {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    name: String,
+    barcode: Option<String>,
+    current: Decimal,
+    safe: Decimal,
+    unit: Option<String>,
+    #[serde(alias = "packageUnit")]
+    package_unit: Option<String>,
+    #[serde(alias = "packageSize")]
+    package_size: Option<Decimal>,
+    #[serde(default, alias = "palletUnit")]
+    pallet_unit: Option<String>,
+    #[serde(default, alias = "palletSize")]
+    pallet_size: Option<Decimal>,
+    #[serde(default, alias = "generateBarcode")]
+    generate_barcode: Option<bool>,
+    note: Option<String>,
+    cycle: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct UserRecord {
+    id: Uuid,
+    username: Option<String>,
+    email: String,
+    name: String,
+    role: String,
+    status: String,
+    #[serde(rename = "warehouseId")]
+    warehouse_id: Option<String>,
+    #[serde(rename = "adminEmail")]
+    admin_email: Option<String>,
+    #[serde(rename = "requestedAdminEmail")]
+    requested_admin_email: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+    #[serde(rename = "approvedAt")]
+    approved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct UserAction {
+    action: String,
+    email: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    name: Option<String>,
+    role: Option<String>,
+    #[serde(alias = "adminEmail")]
+    admin_email: Option<String>,
+    #[serde(alias = "targetEmail")]
+    target_email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserQuery {
+    action: Option<String>,
+    email: Option<String>,
+    #[serde(alias = "adminEmail")]
+    admin_email: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct ZoneRecord {
+    id: String,
+    #[serde(rename = "warehouseId")]
+    warehouse_id: String,
+    name: String,
+    state: String,
+    #[serde(rename = "stateLabel")]
+    state_label: String,
+    temp: String,
+    items: Value,
+    capacity: Decimal,
+    #[serde(rename = "capacityUnit")]
+    capacity_unit: String,
+    #[serde(rename = "currentStockSum")]
+    current_stock_sum: Decimal,
+    #[serde(rename = "emptyRatio")]
+    empty_ratio: f64,
+    #[serde(rename = "updatedAt")]
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct ZoneQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SaveZone {
+    id: String,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    name: String,
+    state: Option<String>,
+    state_label: Option<String>,
+    temp: Option<String>,
+    items: Option<Value>,
+    capacity: Option<Decimal>,
+    #[serde(alias = "capacityUnit")]
+    capacity_unit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateInventoryItem {
+    id: Uuid,
+    barcode: Option<String>,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    current: Option<Decimal>,
+    quantity: Option<Decimal>,
+    #[serde(alias = "quantityUnit")]
+    quantity_unit: Option<String>,
+    safe: Option<Decimal>,
+    #[serde(alias = "safetyStockMode")]
+    safety_stock_mode: Option<String>,
+    #[serde(alias = "movementType")]
+    movement_type: Option<String>,
+    note: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetSafetyStockMode {
+    id: Uuid,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    mode: String,
+    #[serde(alias = "leadTimeDays")]
+    lead_time_days: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct MovementQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+    days: Option<i32>,
+    operator: Option<String>,
+    source: Option<String>,
+    #[serde(alias = "movementType")]
+    movement_type: Option<String>,
+    item: Option<String>,
+    limit: Option<i64>,
+    #[serde(alias = "itemId")]
+    item_id: Option<Uuid>,
+    before: Option<DateTime<Utc>>,
+    #[serde(alias = "beforeId")]
+    before_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct ForecastQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+    #[serde(alias = "historyDays")]
+    history_days: Option<i32>,
+}
+
+const FORECAST_LOOKBACK_DAYS: usize = 90;
+const FORECAST_VALIDATION_DAYS: usize = 180;
+const FORECAST_ORIGIN_STEP_DAYS: usize = 7;
+const FORECAST_MIN_TRAINING_SAMPLES: usize = 60;
+type DemandForest = RandomForestRegressor<f64, f64, DenseMatrix<f64>, Vec<f64>>;
+
+struct ForecastModelResult {
+    predictions: Vec<Option<Decimal>>,
+    baseline_predictions: Vec<Option<Decimal>>,
+    item_wape: Vec<Option<Decimal>>,
+    item_baseline_wape: Vec<Option<Decimal>>,
+    item_samples: Vec<usize>,
+    wape: Option<Decimal>,
+    baseline_wape: Option<Decimal>,
+    relative_improvement: Option<Decimal>,
+    sample_count: usize,
+    actual_volume: Decimal,
+}
+
+#[derive(Deserialize)]
+struct HistoricalMovementImport {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    #[serde(alias = "sourceName")]
+    source_name: String,
+    #[serde(default, alias = "newItems")]
+    new_items: Vec<HistoricalInventorySeed>,
+    #[serde(default, alias = "allowDuplicates")]
+    allow_duplicates: bool,
+    rows: Vec<HistoricalMovementRow>,
+}
+
+#[derive(Deserialize)]
+struct HistoricalInventorySeed {
+    name: String,
+    current: Decimal,
+    safe: Option<Decimal>,
+    unit: String,
+    barcode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HistoricalMovementRow {
+    #[serde(alias = "sourceRow")]
+    source_row: Option<usize>,
+    #[serde(alias = "inventoryItemId")]
+    inventory_item_id: Option<Uuid>,
+    #[serde(alias = "itemName")]
+    item_name: Option<String>,
+    #[serde(alias = "occurredAt")]
+    occurred_at: DateTime<Utc>,
+    #[serde(alias = "movementType")]
+    movement_type: String,
+    quantity: Decimal,
+    #[serde(alias = "quantityUnit")]
+    quantity_unit: Option<String>,
+    note: String,
+    reference: Option<String>,
+}
+
+struct PreparedMovementImportRow {
+    source_row: usize,
+    inventory_item_id: Uuid,
+    item_name: String,
+    occurred_at: DateTime<Utc>,
+    movement_type: String,
+    quantity_delta: Decimal,
+    note: String,
+    reference: String,
+}
+
+#[derive(Deserialize)]
+struct MovementImportQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportRowsQuery {
+    #[serde(alias = "batchId")]
+    batch_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct ReviewMovementImport {
+    id: Uuid,
+    approve: bool,
+    note: Option<String>,
+}
+
+struct ApprovedMovementInsert {
+    warehouse_id: String,
+    item_id: Uuid,
+    item_name: String,
+    movement_type: String,
+    quantity_delta: Decimal,
+    balance_after: Decimal,
+    note: String,
+    source: String,
+    actor_id: String,
+    actor_email: String,
+    occurred_at: DateTime<Utc>,
+}
+
+async fn apply_approved_movement_changes(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    inserts: &[ApprovedMovementInsert],
+    balance_updates: &[(Uuid, Decimal)],
+) -> Result<(), sqlx::Error> {
+    const BATCH_SIZE: usize = 500;
+
+    for chunk in inserts.chunks(BATCH_SIZE) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email,created_at) ",
+        );
+        query.push_values(chunk, |mut values, row| {
+            values
+                .push_bind(&row.warehouse_id)
+                .push_bind(row.item_id)
+                .push_bind(&row.item_name)
+                .push_bind(&row.movement_type)
+                .push_bind(row.quantity_delta)
+                .push_bind(row.balance_after)
+                .push_bind(&row.note)
+                .push_bind(&row.source)
+                .push_bind(&row.actor_id)
+                .push_bind(&row.actor_email)
+                .push_bind(row.occurred_at);
+        });
+        query.build().execute(&mut **transaction).await?;
+    }
+
+    for chunk in balance_updates.chunks(BATCH_SIZE) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "UPDATE inventory_movements AS movement SET balance_after=updated.balance_after FROM ",
+        );
+        query.push("(");
+        query.push_values(chunk, |mut values, (id, balance)| {
+            values.push_bind(id).push_bind(balance);
+        });
+        query.push(") AS updated(id,balance_after) WHERE movement.id=updated.id");
+        query.build().execute(&mut **transaction).await?;
+    }
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct VisionEstimateQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+    id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct ReviewVisionEstimate {
+    id: Uuid,
+    approve: bool,
+    #[serde(alias = "inventoryItemId")]
+    inventory_item_id: Option<Uuid>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct InventoryMovementDay {
+    day: chrono::NaiveDate,
+    inbound: Decimal,
+    outbound: Decimal,
+    adjustments: Decimal,
+    movement_count: i64,
+}
+
+#[derive(Deserialize)]
+struct DeleteInventoryQuery {
+    id: Uuid,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeleteZoneQuery {
+    id: String,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct ItemReference {
+    id: Uuid,
+    #[serde(rename = "warehouseId")]
+    warehouse_id: String,
+    name: String,
+    description: String,
+    thumbnail: String,
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceQuery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+    id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct CreateReference {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    image: String,
+    name: String,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportReferences {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: String,
+    items: Vec<ImportReferenceItem>,
+}
+
+#[derive(Deserialize)]
+struct ImportReferenceItem {
+    name: String,
+    image: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct DeliveryRecord {
+    id: Uuid,
+    #[serde(rename = "warehouseId")]
+    warehouse_id: String,
+    invoice_no: String,
+    carrier_code: String,
+    carrier_name: String,
+    item_name: String,
+    sender_name: String,
+    receiver_name: String,
+    status: String,
+    status_code: String,
+    current_location: String,
+    delivered_at: Option<DateTime<Utc>>,
+    tracking_details: Value,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct CreateDelivery {
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+    invoice_no: String,
+    carrier_code: Option<String>,
+    carrier_name: Option<String>,
+    item_name: Option<String>,
+    sender_name: Option<String>,
+    receiver_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeliveryQuery {
+    id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct TrackDeliveryInput {
+    id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct MonitorInput {
+    image: String,
+    #[serde(alias = "itemName")]
+    item_name: Option<String>,
+    #[serde(alias = "cameraUrl")]
+    camera_url: Option<String>,
+    #[serde(alias = "warehouseId")]
+    warehouse_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AnalysisResult {
+    #[serde(rename = "itemName")]
+    item_name: String,
+    #[serde(rename = "estimatedQuantity")]
+    estimated_quantity: Decimal,
+    unit: String,
+    status: String,
+    #[serde(rename = "statusLabel")]
+    status_label: String,
+    confidence: i32,
+    recommendation: String,
+    reason: String,
+    #[serde(rename = "visualFeatures", default)]
+    visual_features: VisualFeatures,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VisualFeatures {
+    #[serde(default)]
+    objects: Vec<String>,
+    #[serde(default)]
+    colors: Vec<String>,
+    #[serde(default)]
+    shapes_and_edges: Vec<String>,
+    #[serde(default)]
+    text: Vec<String>,
+    #[serde(default)]
+    logos: Vec<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    quantity_basis: String,
+}
+
+async fn validate_database_state(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    let allow_empty = env::var("ALLOW_EMPTY_DATABASE")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+
+    let critical_tables = [
+        "warehouses",
+        "inventory_items",
+        "inventory_movements",
+        "users",
+        "warehouse_zones",
+    ];
+
+    let mut empty_tables = Vec::new();
+    for table in critical_tables {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await?;
+        if count == 0 {
+            empty_tables.push(table.to_string());
+        }
+    }
+
+    if !empty_tables.is_empty() && !allow_empty {
+        return Err(format!(
+            "Critical database tables are empty: {}. This usually means the database was reset or connected to a blank Postgres instance. Restore a backup or set ALLOW_EMPTY_DATABASE=true only for a deliberate local bootstrap.",
+            empty_tables.join(", ")
+        ).into());
+    }
+
+    if !empty_tables.is_empty() {
+        tracing::warn!(
+            "Starting with empty bootstrap tables in a controlled local mode: {}. Set ALLOW_EMPTY_DATABASE=false for production restores.",
+            empty_tables.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt::init();
+
+    let database_url = env::var("DATABASE_URL").ok();
+    let db = match database_url {
+        Some(url) => Some(
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&url)
+                .await?,
+        ),
+        None => {
+            tracing::warn!("DATABASE_URL is not set; starting in health-only mode");
+            None
+        }
+    };
+    if let Some(pool) = &db {
+        let schema_sql = include_str!("../schema.sql");
+        sqlx::raw_sql(schema_sql).execute(pool).await?;
+        validate_database_state(pool).await?;
+        sqlx::query("ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS barcode TEXT")
+            .execute(pool)
+            .await?;
+        sqlx::query("ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT '톤', ADD COLUMN IF NOT EXISTS package_unit TEXT, ADD COLUMN IF NOT EXISTS package_size NUMERIC(20,6) NOT NULL DEFAULT 1, ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS pallet_unit TEXT, ADD COLUMN IF NOT EXISTS pallet_size NUMERIC(20,6) NOT NULL DEFAULT 1, ADD COLUMN IF NOT EXISTS pending_batch_id UUID")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS safety_stock_mode TEXT NOT NULL DEFAULT 'manual', ADD COLUMN IF NOT EXISTS safety_stock_prompted BOOLEAN NOT NULL DEFAULT FALSE, ADD COLUMN IF NOT EXISTS safety_stock_lead_time_days INTEGER NOT NULL DEFAULT 7, ADD COLUMN IF NOT EXISTS safety_stock_service_level NUMERIC(5,4) NOT NULL DEFAULT 0.9500")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS inventory_items_safety_stock_mode_check, ADD CONSTRAINT inventory_items_safety_stock_mode_check CHECK (safety_stock_mode IN ('manual','auto')), DROP CONSTRAINT IF EXISTS inventory_items_safety_stock_lead_time_days_check, ADD CONSTRAINT inventory_items_safety_stock_lead_time_days_check CHECK (safety_stock_lead_time_days BETWEEN 1 AND 60), DROP CONSTRAINT IF EXISTS inventory_items_safety_stock_service_level_check, ADD CONSTRAINT inventory_items_safety_stock_service_level_check CHECK (safety_stock_service_level > 0 AND safety_stock_service_level < 1)")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_items ALTER COLUMN current TYPE NUMERIC(20,6) USING current::numeric, ALTER COLUMN safe TYPE NUMERIC(20,6) USING safe::numeric, ALTER COLUMN package_size TYPE NUMERIC(20,6) USING package_size::numeric")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE warehouse_zones ALTER COLUMN capacity TYPE NUMERIC(20,6) USING capacity::numeric")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE warehouse_zones ADD COLUMN IF NOT EXISTS capacity_unit TEXT NOT NULL DEFAULT '톤'")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE monitor_logs ALTER COLUMN estimated_quantity TYPE NUMERIC(20,6) USING estimated_quantity::numeric")
+            .execute(pool).await?;
+        sqlx::query("DROP INDEX IF EXISTS inventory_items_warehouse_barcode_key")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE UNIQUE INDEX inventory_items_warehouse_barcode_key ON inventory_items (warehouse_id, barcode) WHERE barcode IS NOT NULL AND archived_at IS NULL")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE delivery_tracking ADD COLUMN IF NOT EXISTS warehouse_id TEXT REFERENCES warehouses(id) ON DELETE CASCADE")
+            .execute(pool).await?;
+        sqlx::query(
+            "UPDATE delivery_tracking SET warehouse_id = 'wh_wjmals' WHERE warehouse_id IS NULL",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("ALTER TABLE delivery_tracking ALTER COLUMN warehouse_id SET NOT NULL")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS inventory_movements (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE, inventory_item_id UUID NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE, item_name TEXT NOT NULL, movement_type TEXT NOT NULL CHECK (movement_type IN ('initial', 'inbound', 'outbound', 'adjustment', 'vision_estimate')), quantity_delta BIGINT NOT NULL, balance_after BIGINT NOT NULL CHECK (balance_after >= 0), note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual', ADD COLUMN IF NOT EXISTS actor_id TEXT, ADD COLUMN IF NOT EXISTS actor_email TEXT")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movements ALTER COLUMN quantity_delta TYPE NUMERIC(20,6) USING quantity_delta::numeric, ALTER COLUMN balance_after TYPE NUMERIC(20,6) USING balance_after::numeric")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movements DROP CONSTRAINT IF EXISTS inventory_movements_movement_type_check, DROP CONSTRAINT IF EXISTS inventory_movements_inventory_item_id_fkey")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movements ADD CONSTRAINT inventory_movements_movement_type_check CHECK (movement_type IN ('initial','inbound','outbound','adjustment','vision_estimate','historical_import')), ADD CONSTRAINT inventory_movements_inventory_item_id_fkey FOREIGN KEY (inventory_item_id) REFERENCES inventory_items(id) ON DELETE RESTRICT")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS inventory_movements_warehouse_created_idx ON inventory_movements (warehouse_id, created_at DESC)")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS inventory_movements_duplicate_lookup_idx ON inventory_movements (warehouse_id,inventory_item_id,created_at,movement_type,quantity_delta)")
+            .execute(pool).await?;
+        sqlx::query("INSERT INTO inventory_movements (warehouse_id, inventory_item_id, item_name, movement_type, quantity_delta, balance_after, note) SELECT i.warehouse_id, i.id, i.name, 'initial', i.current, i.current, 'inventory ledger initialization' FROM inventory_items i WHERE NOT EXISTS (SELECT 1 FROM inventory_movements m WHERE m.inventory_item_id = i.id)")
+            .execute(pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS inventory_audit_events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE, actor_id TEXT NOT NULL, actor_email TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, before_data JSONB, after_data JSONB, reason TEXT NOT NULL, source TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS inventory_audit_events_warehouse_created_idx ON inventory_audit_events (warehouse_id, created_at DESC)")
+            .execute(pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS inventory_movement_import_batches (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE, submitted_by TEXT NOT NULL, submitted_email TEXT NOT NULL, source_name TEXT NOT NULL, row_count INTEGER NOT NULL CHECK (row_count > 0), status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','APPROVED','REJECTED')), reviewed_by TEXT, reviewed_email TEXT, reviewed_at TIMESTAMPTZ, review_note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+            .execute(pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS inventory_movement_import_rows (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), batch_id UUID NOT NULL REFERENCES inventory_movement_import_batches(id) ON DELETE CASCADE, inventory_item_id UUID NOT NULL REFERENCES inventory_items(id) ON DELETE RESTRICT, item_name TEXT NOT NULL, occurred_at TIMESTAMPTZ NOT NULL, movement_type TEXT NOT NULL CHECK (movement_type IN ('inbound','outbound','adjustment')), quantity_delta NUMERIC(20,6) NOT NULL CHECK (quantity_delta <> 0), note TEXT NOT NULL, reference TEXT NOT NULL DEFAULT '')")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS inventory_movement_import_rows_duplicate_lookup_idx ON inventory_movement_import_rows (batch_id,inventory_item_id,occurred_at,movement_type,quantity_delta)")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS inventory_movement_import_batches_warehouse_status_idx ON inventory_movement_import_batches (warehouse_id,status,id)")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movement_import_batches DROP CONSTRAINT IF EXISTS inventory_movement_import_batches_row_count_check")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_movement_import_rows DROP CONSTRAINT IF EXISTS inventory_movement_import_rows_movement_type_check, ADD CONSTRAINT inventory_movement_import_rows_movement_type_check CHECK (movement_type IN ('inbound','outbound','adjustment','vision_estimate'))")
+            .execute(pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS inventory_vision_estimates (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE, inventory_item_id UUID REFERENCES inventory_items(id) ON DELETE RESTRICT, item_name TEXT NOT NULL, estimated_quantity NUMERIC(20,6) NOT NULL CHECK (estimated_quantity >= 0), unit TEXT NOT NULL, confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100), recommendation TEXT NOT NULL, reason TEXT NOT NULL, image_snapshot TEXT, submitted_by TEXT NOT NULL, submitted_email TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','APPROVED','REJECTED')), reviewed_by TEXT, reviewed_email TEXT, reviewed_at TIMESTAMPTZ, review_note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+            .execute(pool).await?;
+        sqlx::query("ALTER TABLE inventory_vision_estimates ADD COLUMN IF NOT EXISTS visual_features JSONB NOT NULL DEFAULT '{}'::jsonb")
+            .execute(pool).await?;
+    }
+
+    let jwt_secret = env::var("JWT_SECRET").unwrap_or_else(|_| {
+        let mut bytes = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        tracing::warn!(
+            "JWT_SECRET is unset; using a temporary process secret (sessions reset on restart)"
+        );
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    });
+    let state = AppState { db, jwt_secret };
+    let protected_routes = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/api/inventory",
+            get(list_inventory)
+                .post(create_inventory)
+                .patch(update_inventory)
+                .delete(delete_inventory),
+        )
+        .route(
+            "/api/inventory/safety-stock",
+            axum::routing::post(set_safety_stock_mode),
+        )
+        .route("/api/inventory/movements", get(list_inventory_movements))
+        .route("/api/inventory/forecast", get(list_inventory_forecast))
+        .route("/api/inventory/ledger", get(list_inventory_ledger))
+        .route(
+            "/api/inventory/import",
+            axum::routing::post(submit_movement_import),
+        )
+        .route("/api/inventory/imports", get(list_movement_imports))
+        .route(
+            "/api/inventory/imports/rows",
+            get(list_movement_import_rows),
+        )
+        .route(
+            "/api/inventory/imports/review",
+            axum::routing::post(review_movement_import),
+        )
+        .route(
+            "/api/users",
+            get(get_users).post(users_action).delete(delete_user),
+        )
+        .route(
+            "/api/zones",
+            get(list_zones).post(save_zone).delete(delete_zone),
+        )
+        .route("/api/vision/analyze", axum::routing::post(analyze_monitor_image))
+        .route("/api/vision/estimates", get(list_vision_estimates))
+        .route("/api/vision/estimate", get(get_vision_estimate))
+        .route(
+            "/api/vision/review",
+            axum::routing::post(review_vision_estimate),
+        )
+        .route("/api/monitor", get(list_monitor_logs))
+        .route(
+            "/api/delivery",
+            get(list_delivery)
+                .post(create_delivery)
+                .delete(delete_delivery)
+                .put(advance_delivery),
+        )
+        .route("/api/delivery/track", axum::routing::post(track_delivery))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_request,
+        ));
+    let allowed_origins = env::var("FRONTEND_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://127.0.0.1:3000".to_string())
+        .split(',')
+        .filter_map(|origin| HeaderValue::from_str(origin.trim()).ok())
+        .collect::<Vec<_>>();
+    let cors = CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .allow_credentials(true);
+    let app = Router::new()
+        .merge(protected_routes)
+        .with_state(state)
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    let port = env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8080);
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    tracing::info!(%address, "WMS Rust API listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn authenticate_request(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let (mut parts, body) = request.into_parts();
+    let bytes = to_bytes(body, 25 * 1024 * 1024).await.map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body is too large".to_string(),
+        )
+    })?;
+    let mut body_value = serde_json::from_slice::<Value>(&bytes).ok();
+
+    let public_auth = parts.uri.path() == "/api/users"
+        && parts.method == axum::http::Method::POST
+        && body_value
+            .as_ref()
+            .and_then(|body| body.get("action"))
+            .and_then(Value::as_str)
+            .is_some_and(|action| matches!(action, "login" | "signup"));
+    if parts.uri.path() == "/health" || public_auth {
+        return Ok(next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await);
+    }
+
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            "유효한 로그인 세션이 필요합니다.".to_string(),
+        )
+    };
+    let token = parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(unauthorized)?;
+    let claims = decode::<SessionClaims>(
+        token,
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| unauthorized())?
+    .claims;
+
+    let current_user = if claims.role == "서버 관리자" && claims.email == "yewon@wms-smartstock.ai"
+    {
+        AuthenticatedUser {
+            id: claims.sub.clone(),
+            email: claims.email.clone(),
+            role: claims.role.clone(),
+            status: "APPROVED".to_string(),
+            warehouse_id: claims.warehouse_id.clone(),
+        }
+    } else {
+        let db = state.db.as_ref().ok_or_else(database_not_configured)?;
+        let row = sqlx::query_as::<_, (Uuid, String, String, String, Option<String>)>(
+            "SELECT id, email, role, status, warehouse_id FROM users WHERE email = $1",
+        )
+        .bind(&claims.email)
+        .fetch_optional(db)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(unauthorized)?;
+        if row.0.to_string() != claims.sub {
+            return Err(unauthorized());
+        }
+        AuthenticatedUser {
+            id: row.0.to_string(),
+            email: row.1,
+            role: row.2,
+            status: row.3,
+            warehouse_id: row.4,
+        }
+    };
+
+    if current_user.status != "APPROVED" {
+        let is_account_refresh = parts.uri.path() == "/api/users"
+            && parts.method == Method::GET
+            && parts
+                .uri
+                .query()
+                .is_some_and(|query| query.split('&').any(|pair| pair == "action=get_user"));
+        let is_access_request = parts.uri.path() == "/api/users"
+            && parts.method == Method::POST
+            && body_value
+                .as_ref()
+                .and_then(|body| body.get("action"))
+                .and_then(Value::as_str)
+                == Some("request_access")
+            && current_user.role == "창고지기";
+        if !is_account_refresh && !is_access_request {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "승인 대기 계정은 본인 정보 확인과 창고 접근 요청만 할 수 있습니다.".to_string(),
+            ));
+        }
+    }
+
+    let path = parts.uri.path();
+    let scoped_path = path.starts_with("/api/inventory")
+        || path == "/api/zones"
+        || path.starts_with("/api/vision")
+        || path == "/api/monitor";
+    if scoped_path && current_user.role != "서버 관리자" {
+        let warehouse_id = current_user
+            .warehouse_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "계정에 배정된 창고가 없습니다.".to_string(),
+                )
+            })?;
+        let query_pairs: Vec<(String, String)> = parts
+            .uri
+            .query()
+            .map(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let requested_warehouse = query_pairs
+            .iter()
+            .find(|(key, _)| key == "warehouseId" || key == "warehouse_id")
+            .map(|(_, value)| value.as_str());
+        if requested_warehouse.is_some_and(|requested| requested != warehouse_id) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "다른 창고에는 접근할 수 없습니다.".to_string(),
+            ));
+        }
+        if parts.uri.query().is_some()
+            || parts.method == axum::http::Method::GET
+            || parts.method == axum::http::Method::DELETE
+        {
+            if !query_pairs
+                .iter()
+                .any(|(key, _)| key == "warehouseId" || key == "warehouse_id")
+            {
+                let mut pairs = query_pairs;
+                pairs.push(("warehouseId".to_string(), warehouse_id.to_string()));
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(pairs)
+                    .finish();
+                let path = parts.uri.path().to_string();
+                parts.uri = format!("{path}?{query}")
+                    .parse()
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "invalid request URL".to_string()))?;
+            }
+        } else if let Some(value) = body_value.as_mut().and_then(Value::as_object_mut) {
+            if value
+                .get("warehouseId")
+                .or_else(|| value.get("warehouse_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|requested| requested != warehouse_id)
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "다른 창고에는 접근할 수 없습니다.".to_string(),
+                ));
+            }
+            value.insert(
+                "warehouseId".to_string(),
+                Value::String(warehouse_id.to_string()),
+            );
+        }
+        let bytes = if let Some(value) = body_value {
+            serde_json::to_vec(&value).unwrap_or_default()
+        } else {
+            bytes.to_vec()
+        };
+        parts.headers.remove(CONTENT_LENGTH);
+        parts.extensions.insert(current_user);
+        return Ok(next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await);
+    }
+
+    let bytes = body_value
+        .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+        .unwrap_or_else(|| bytes.to_vec());
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.extensions.insert(current_user);
+    Ok(next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await)
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        database: if state.db.is_some() {
+            "configured"
+        } else {
+            "not_configured"
+        },
+    })
+}
+
+async fn list_inventory(
+    State(state): State<AppState>,
+    Query(query): Query<InventoryQuery>,
+) -> Result<Json<Vec<InventoryItem>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(|| database_not_configured())?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let items = sqlx::query_as::<_, InventoryItem>(
+        "SELECT id,warehouse_id,name,barcode,current,safe,safety_stock_mode,safety_stock_prompted,safety_stock_lead_time_days,safety_stock_service_level,unit,package_unit,package_size,pallet_unit,pallet_size,status,status_label,diff_text,recommendation,cycle,date,created_at,updated_at
+         FROM inventory_items WHERE warehouse_id=$1 AND archived_at IS NULL ORDER BY name",
+    )
+    .bind(warehouse_id)
+    .fetch_all(&db)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(items))
+}
+
+async fn create_inventory(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<CreateInventoryItem>,
+) -> Result<(StatusCode, Json<InventoryItem>), (StatusCode, String)> {
+    let package_size = input.package_size.unwrap_or(Decimal::ONE);
+    let pallet_size = input.pallet_size.unwrap_or(Decimal::ONE);
+    let unit = input
+        .unit
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ea");
+    if input.name.trim().is_empty()
+        || input.current < Decimal::ZERO
+        || input.safe < Decimal::ZERO
+        || package_size <= Decimal::ZERO
+        || pallet_size <= Decimal::ZERO
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name, current, safe, and packageSize are invalid".to_string(),
+        ));
+    }
+    if unit.chars().count() > 16
+        || input
+            .package_unit
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 16)
+        || input
+            .pallet_unit
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 16)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "unit names must contain 1 to 16 characters".to_string(),
+        ));
+    }
+
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let barcode_value: Option<String> = match input
+        .barcode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(own) => Some(own.to_string()),
+        None if input.generate_barcode.unwrap_or(false) => {
+            Some(generate_barcode(&db, &input.warehouse_id).await?)
+        }
+        None => None,
+    };
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let (status, status_label, diff_text, recommendation) =
+        classify_stock(input.current, input.safe, unit);
+    let item = sqlx::query_as::<_, InventoryItem>(
+        "INSERT INTO inventory_items (warehouse_id,name,barcode,unit,package_unit,package_size,pallet_unit,pallet_size,current,safe,status,status_label,diff_text,recommendation,cycle,date)
+         VALUES ($1,$2,$3,$4,$5,$6,$14,$15,$7,$8,$9,$10,$11,$12,$13,CURRENT_DATE)
+         RETURNING id,warehouse_id,name,barcode,current,safe,safety_stock_mode,safety_stock_prompted,safety_stock_lead_time_days,safety_stock_service_level,unit,package_unit,package_size,pallet_unit,pallet_size,status,status_label,diff_text,recommendation,cycle,date,created_at,updated_at",
+    ).bind(&input.warehouse_id).bind(input.name.trim())
+        .bind(barcode_value.as_deref())
+        .bind(unit).bind(input.package_unit.as_deref().filter(|value| !value.trim().is_empty())).bind(package_size)
+        .bind(input.current).bind(input.safe).bind(status).bind(status_label).bind(diff_text).bind(recommendation)
+        .bind(input.cycle.unwrap_or_else(|| "월간".to_string()))
+        .bind(input.pallet_unit.as_deref().map(str::trim).filter(|value| !value.is_empty())).bind(pallet_size)
+        .fetch_one(&mut *transaction).await.map_err(internal_error)?;
+    let reason = input
+        .note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("초기 재고 등록");
+    sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email) VALUES ($1,$2,$3,'initial',$4,$4,$5,'manual',$6,$7)")
+        .bind(&item.warehouse_id).bind(item.id).bind(&item.name).bind(item.current).bind(reason).bind(&user.id).bind(&user.email).execute(&mut *transaction).await.map_err(internal_error)?;
+    sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,after_data,reason,source) VALUES ($1,$2,$3,'create','inventory_item',$4,$5,$6,'manual')")
+        .bind(&item.warehouse_id).bind(&user.id).bind(&user.email).bind(item.id.to_string())
+        .bind(serde_json::json!({"name": &item.name,"barcode": &item.barcode,"current": item.current,"safe": item.safe,"unit": &item.unit,"packageUnit": &item.package_unit,"packageSize": item.package_size}))
+        .bind(reason).execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+
+    Ok((StatusCode::CREATED, Json(item)))
+}
+
+async fn update_inventory(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<UpdateInventoryItem>,
+) -> Result<Json<InventoryItem>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let existing = sqlx::query_as::<_, (String, String, Decimal, Decimal, String, Option<String>, Decimal, String, i32, Decimal, Option<String>, Decimal)>("SELECT warehouse_id,name,current,safe,unit,package_unit,package_size,safety_stock_mode,safety_stock_lead_time_days,safety_stock_service_level,pallet_unit,pallet_size FROM inventory_items WHERE id=$1 AND warehouse_id=$2 AND archived_at IS NULL FOR UPDATE")
+        .bind(input.id).bind(&input.warehouse_id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "해당 아이템을 찾을 수 없습니다.".to_string()))?;
+    let reason = input
+        .note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "변동 또는 수정 사유를 입력해야 합니다.".to_string(),
+            )
+        })?;
+    let source = input
+        .source
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("manual");
+    let movement_type = input
+        .movement_type
+        .unwrap_or_else(|| "adjustment".to_string());
+    if !matches!(
+        movement_type.as_str(),
+        "inbound" | "outbound" | "adjustment"
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "movementType does not match the stock change".to_string(),
+        ));
+    }
+    let delta = if let Some(target) = input.current {
+        target - existing.2
+    } else if let Some(quantity) = input.quantity {
+        if quantity <= Decimal::ZERO {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "quantity must be greater than zero".to_string(),
+            ));
+        }
+        let entered_unit = input.quantity_unit.as_deref().unwrap_or(&existing.4);
+        let multiplier = unit_multiplier(
+            entered_unit,
+            &existing.4,
+            existing.5.as_deref(),
+            existing.6,
+            existing.10.as_deref(),
+            existing.11,
+        )
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "quantityUnit must match the item's base, package, or pallet unit".to_string(),
+            )
+        })?;
+        let converted = quantity * multiplier;
+        if movement_type == "outbound" {
+            -converted
+        } else {
+            converted
+        }
+    } else if input.safe.is_some() || input.barcode.is_some() {
+        Decimal::ZERO
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "current, quantity, or safe is required".to_string(),
+        ));
+    };
+    if (movement_type == "inbound" && delta < Decimal::ZERO)
+        || (movement_type == "outbound" && delta >= Decimal::ZERO)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "movementType does not match the stock change".to_string(),
+        ));
+    }
+    let current = existing.2 + delta;
+    if current < Decimal::ZERO {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "current must be non-negative".to_string(),
+        ));
+    }
+    let safe = input.safe.unwrap_or(existing.3);
+    if safe < Decimal::ZERO {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "safe must be non-negative".to_string(),
+        ));
+    }
+    let safety_stock_mode = input.safety_stock_mode.as_deref().unwrap_or(&existing.7);
+    if !matches!(safety_stock_mode, "manual" | "auto") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "safetyStockMode must be manual or auto".to_string(),
+        ));
+    }
+    let (status, status_label, diff_text, recommendation) =
+        classify_stock(current, safe, &existing.4);
+    let mut item = sqlx::query_as::<_, InventoryItem>(
+        "UPDATE inventory_items SET current=$1,safe=$2,safety_stock_mode=$3,status=$4,status_label=$5,diff_text=$6,recommendation=$7,barcode=CASE WHEN $10 THEN $11 ELSE barcode END,updated_at=now()
+         WHERE id=$8 AND warehouse_id=$9
+         RETURNING id,warehouse_id,name,barcode,current,safe,safety_stock_mode,safety_stock_prompted,safety_stock_lead_time_days,safety_stock_service_level,unit,package_unit,package_size,pallet_unit,pallet_size,status,status_label,diff_text,recommendation,cycle,date,created_at,updated_at",
+    ).bind(current).bind(safe).bind(safety_stock_mode).bind(status).bind(status_label).bind(diff_text).bind(recommendation)
+    .bind(input.id).bind(input.warehouse_id).bind(input.barcode.is_some()).bind(input.barcode.as_deref().map(str::trim).filter(|value| !value.is_empty()))
+    .fetch_optional(&mut *transaction).await.map_err(|error| {
+        if error.as_database_error().is_some_and(|db_error| db_error.is_unique_violation()) {
+            (StatusCode::CONFLICT, "이미 다른 품목이 사용 중인 바코드입니다.".to_string())
+        } else { internal_error(error) }
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "해당 아이템을 찾을 수 없습니다.".to_string()))?;
+    if delta != Decimal::ZERO {
+        sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+            .bind(&existing.0).bind(item.id).bind(&existing.1).bind(&movement_type).bind(delta).bind(item.current).bind(reason).bind(source).bind(&user.id).bind(&user.email)
+            .execute(&mut *transaction).await.map_err(internal_error)?;
+    }
+    if item.safety_stock_mode == "auto" && movement_type == "outbound" && delta < Decimal::ZERO {
+        let daily = load_safety_stock_history(&mut transaction, item.id)
+            .await
+            .map_err(internal_error)?;
+        let active_days = daily.iter().filter(|value| **value > Decimal::ZERO).count();
+        if safety_stock_data_is_eligible(daily.len(), active_days) {
+            if let Some(recommended) = calculate_safety_stock(
+                &daily,
+                item.safety_stock_lead_time_days,
+                item.safety_stock_service_level,
+            ) {
+                let (status, status_label, diff_text, recommendation) =
+                    classify_stock(item.current, recommended, &item.unit);
+                item = sqlx::query_as::<_, InventoryItem>(
+                "UPDATE inventory_items SET safe=$1,status=$2,status_label=$3,diff_text=$4,recommendation=$5,updated_at=now() WHERE id=$6 AND warehouse_id=$7
+                 RETURNING id,warehouse_id,name,barcode,current,safe,safety_stock_mode,safety_stock_prompted,safety_stock_lead_time_days,safety_stock_service_level,unit,package_unit,package_size,pallet_unit,pallet_size,status,status_label,diff_text,recommendation,cycle,date,created_at,updated_at",
+            ).bind(recommended).bind(status).bind(status_label).bind(diff_text).bind(recommendation).bind(item.id).bind(&item.warehouse_id)
+                .fetch_one(&mut *transaction).await.map_err(internal_error)?;
+            }
+        }
+    }
+    sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,before_data,after_data,reason,source) VALUES ($1,$2,$3,$4,'inventory_item',$5,$6,$7,$8,$9)")
+        .bind(&existing.0).bind(&user.id).bind(&user.email).bind(if delta.is_zero() { "update" } else { movement_type.as_str() }).bind(item.id.to_string())
+        .bind(serde_json::json!({"current": existing.2, "safe": existing.3}))
+        .bind(serde_json::json!({"current": item.current, "safe": item.safe, "delta": delta}))
+        .bind(reason).bind(source).execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    Ok(Json(item))
+}
+
+async fn set_safety_stock_mode(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<SetSafetyStockMode>,
+) -> Result<Json<InventoryItem>, (StatusCode, String)> {
+    if !matches!(input.mode.as_str(), "manual" | "auto") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be manual or auto".to_string(),
+        ));
+    }
+    let warehouse_id = if user.role == "서버 관리자" {
+        input.warehouse_id.clone()
+    } else {
+        let assigned = user.warehouse_id.as_deref().ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "계정에 배정된 창고가 없습니다.".to_string(),
+            )
+        })?;
+        if assigned != input.warehouse_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "다른 창고 품목은 수정할 수 없습니다.".to_string(),
+            ));
+        }
+        assigned.to_string()
+    };
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let item = sqlx::query_as::<_, (Decimal, Decimal, String, String, i32, Decimal)>(
+        "SELECT current,safe,unit,safety_stock_mode,safety_stock_lead_time_days,safety_stock_service_level FROM inventory_items WHERE id=$1 AND warehouse_id=$2 AND archived_at IS NULL FOR UPDATE",
+    ).bind(input.id).bind(&warehouse_id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "재고 품목을 찾을 수 없습니다.".to_string()))?;
+    let lead_time_days = input.lead_time_days.unwrap_or(item.4);
+    if !(1..=60).contains(&lead_time_days) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "leadTimeDays는 1~60일이어야 합니다.".to_string(),
+        ));
+    }
+    let safe = if input.mode == "auto" {
+        let history = load_safety_stock_history(&mut transaction, input.id)
+            .await
+            .map_err(internal_error)?;
+        let recent_outbound_days = history
+            .iter()
+            .rev()
+            .take(180)
+            .filter(|value| **value > Decimal::ZERO)
+            .count();
+        if !safety_stock_data_is_eligible(history.len(), recent_outbound_days) {
+            let pending_imports = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inventory_movement_import_batches WHERE warehouse_id=$1 AND status='PENDING'")
+                .bind(&warehouse_id).fetch_one(&mut *transaction).await.map_err(internal_error)?;
+            let hint = if pending_imports > 0 {
+                format!(
+                    " 승인 대기 중인 가져오기 {}건은 승인 후 반영됩니다.",
+                    pending_imports
+                )
+            } else {
+                String::new()
+            };
+            let last_outbound = sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT MAX(created_at) FROM inventory_movements WHERE inventory_item_id=$1 AND movement_type='outbound'")
+                .bind(input.id).fetch_one(&mut *transaction).await.map_err(internal_error)?;
+            let hint = match last_outbound {
+                Some(at) if recent_outbound_days == 0 => format!(
+                    "{} 가장 최근 출고 기록은 {}이며, 자동 계산은 최근 180일의 출고를 사용합니다.",
+                    hint,
+                    at.format("%Y-%m-%d")
+                ),
+                _ => hint,
+            };
+            return Err((StatusCode::CONFLICT, format!("자동 안전재고를 계산하려면 완료일 35일 이상과 최근 180일 중 출고 기록일 5일 이상이 필요합니다. 현재 완료일 {}일, 최근 출고 기록일 {}일입니다.{}", history.len(), recent_outbound_days, hint)));
+        }
+        calculate_safety_stock(&history, lead_time_days, item.5).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "안전재고 추천값을 계산할 수 없습니다.".to_string(),
+            )
+        })?
+    } else {
+        item.1
+    };
+    let (status, status_label, diff_text, recommendation) = classify_stock(item.0, safe, &item.2);
+    let updated = sqlx::query_as::<_, InventoryItem>(
+        "UPDATE inventory_items SET safe=$1,safety_stock_mode=$2,safety_stock_prompted=TRUE,safety_stock_lead_time_days=$3,status=$4,status_label=$5,diff_text=$6,recommendation=$7,updated_at=now()
+         WHERE id=$8 AND warehouse_id=$9
+         RETURNING id,warehouse_id,name,barcode,current,safe,safety_stock_mode,safety_stock_prompted,safety_stock_lead_time_days,safety_stock_service_level,unit,package_unit,package_size,pallet_unit,pallet_size,status,status_label,diff_text,recommendation,cycle,date,created_at,updated_at",
+    ).bind(safe).bind(&input.mode).bind(lead_time_days).bind(status).bind(status_label).bind(diff_text).bind(recommendation)
+        .bind(input.id).bind(&warehouse_id).fetch_one(&mut *transaction).await.map_err(internal_error)?;
+    sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,before_data,after_data,reason,source) VALUES ($1,$2,$3,'update','inventory_item',$4,$5,$6,$7,'safety_stock')")
+        .bind(&warehouse_id).bind(&user.id).bind(&user.email).bind(input.id.to_string())
+        .bind(serde_json::json!({"safe":item.1,"mode":item.3}))
+        .bind(serde_json::json!({"safe":updated.safe,"mode":updated.safety_stock_mode,"leadTimeDays":lead_time_days}))
+        .bind(if input.mode == "auto" { "자동 안전재고 계산으로 전환" } else { "수동 안전재고 설정으로 전환" })
+        .execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    Ok(Json(updated))
+}
+
+async fn delete_inventory(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteInventoryQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let reason = query
+        .reason
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("재고 품목 보관 처리");
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let item = sqlx::query_as::<_, (String, Decimal, Decimal)>("SELECT name,current,safe FROM inventory_items WHERE id=$1 AND warehouse_id=$2 AND archived_at IS NULL FOR UPDATE")
+        .bind(query.id).bind(&query.warehouse_id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "활성 재고 품목을 찾을 수 없습니다.".to_string()))?;
+    sqlx::query("UPDATE inventory_items SET archived_at=now(),updated_at=now() WHERE id=$1 AND warehouse_id=$2")
+        .bind(query.id).bind(&query.warehouse_id).execute(&mut *transaction).await.map_err(internal_error)?;
+    if item.1 > Decimal::ZERO {
+        sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email) VALUES ($1,$2,$3,'adjustment',$4,0,$5,'archive',$6,$7)")
+            .bind(&query.warehouse_id).bind(query.id).bind(&item.0).bind(-item.1).bind(reason).bind(&user.id).bind(&user.email)
+            .execute(&mut *transaction).await.map_err(internal_error)?;
+    }
+    sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,before_data,after_data,reason,source) VALUES ($1,$2,$3,'archive','inventory_item',$4,$5,$6,$7,'api')")
+        .bind(&query.warehouse_id).bind(&user.id).bind(&user.email).bind(query.id.to_string())
+        .bind(serde_json::json!({"name": item.0, "current": item.1, "safe": item.2}))
+        .bind(serde_json::json!({"archived": true})).bind(reason).execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    Ok(Json(
+        serde_json::json!({ "success": true, "archived": true, "archivedId": query.id }),
+    ))
+}
+
+async fn submit_movement_import(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<HistoricalMovementImport>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    if input.rows.is_empty()
+        || input.rows.len() > 50000
+        || input.new_items.len() > 50000
+        || input.source_name.trim().is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "sourceName and 1 to 50000 transaction rows are required".to_string(),
+        ));
+    }
+    let warehouse_id = if user.role == "서버 관리자" {
+        input.warehouse_id.clone()
+    } else {
+        let assigned = user.warehouse_id.as_deref().ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "계정에 배정된 창고가 없습니다.".to_string(),
+            )
+        })?;
+        if assigned != input.warehouse_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "다른 창고에는 거래를 가져올 수 없습니다.".to_string(),
+            ));
+        }
+        assigned.to_string()
+    };
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let mut created_items = 0;
+    let row_count = input.rows.len();
+    let batch_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO inventory_movement_import_batches (id,warehouse_id,submitted_by,submitted_email,source_name,row_count) VALUES ($1,$2,$3,$4,$5,$6)")
+        .bind(batch_id).bind(&warehouse_id).bind(&user.id).bind(&user.email).bind(input.source_name.trim()).bind(row_count as i32)
+        .execute(&mut *transaction).await.map_err(internal_error)?;
+    for item in input.new_items {
+        let name = item.name.trim();
+        let unit = item.unit.trim();
+        let barcode = item
+            .barcode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let safe = item.safe.unwrap_or(Decimal::ZERO);
+        if name.is_empty()
+            || name.chars().count() > 200
+            || unit.is_empty()
+            || unit.chars().count() > 16
+            || item.current < Decimal::ZERO
+            || safe < Decimal::ZERO
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "new inventory item '{}' has invalid name, unit, current, or safe stock",
+                    name
+                ),
+            ));
+        }
+        if sqlx::query_scalar::<_, Uuid>("SELECT id FROM inventory_items WHERE warehouse_id=$1 AND lower(name)=lower($2) AND archived_at IS NULL ORDER BY created_at DESC LIMIT 1")
+            .bind(&warehouse_id).bind(name).fetch_optional(&mut *transaction).await.map_err(internal_error)?.is_some() {
+            continue;
+        }
+        let (status, status_label, diff_text, recommendation) =
+            classify_stock(item.current, safe, unit);
+        sqlx::query_as::<_, (Uuid, String)>(
+            "INSERT INTO inventory_items (warehouse_id,name,barcode,unit,current,safe,status,status_label,diff_text,recommendation,cycle,date,archived_at,pending_batch_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'월간',CURRENT_DATE,now(),$11)
+             RETURNING id,name",
+        ).bind(&warehouse_id).bind(name).bind(barcode).bind(unit).bind(item.current).bind(safe)
+            .bind(status).bind(status_label).bind(diff_text).bind(recommendation).bind(batch_id)
+            .fetch_one(&mut *transaction).await.map_err(internal_error)?;
+        created_items += 1;
+    }
+
+    let inventory_items = sqlx::query_as::<_, (Uuid, String, String, Option<String>, Decimal, Option<String>, Decimal)>(
+        "SELECT id,name,unit,package_unit,package_size,pallet_unit,pallet_size FROM inventory_items WHERE warehouse_id=$1 AND (archived_at IS NULL OR pending_batch_id=$2) ORDER BY (pending_batch_id IS NULL),created_at DESC",
+    )
+    .bind(&warehouse_id)
+    .bind(batch_id)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    let mut items_by_id = std::collections::HashMap::with_capacity(inventory_items.len());
+    let mut items_by_name = std::collections::HashMap::with_capacity(inventory_items.len());
+    for item in inventory_items {
+        items_by_id.insert(item.0, item.clone());
+        items_by_name.entry(item.1.to_lowercase()).or_insert(item);
+    }
+    let item_ids = items_by_id.keys().copied().collect::<Vec<_>>();
+    let anchor_rows = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+        "SELECT inventory_item_id,MIN(created_at) FROM inventory_movements WHERE warehouse_id=$1 AND movement_type='initial' AND inventory_item_id=ANY($2) GROUP BY inventory_item_id",
+    )
+    .bind(&warehouse_id)
+    .bind(&item_ids)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    let anchors = anchor_rows
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut prepared_rows = Vec::with_capacity(row_count);
+    for (row_index, row) in input.rows.into_iter().enumerate() {
+        let source_row = row.source_row.unwrap_or(row_index + 2);
+        if !matches!(
+            row.movement_type.as_str(),
+            "inbound" | "outbound" | "adjustment" | "vision_estimate"
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{}행: 거래 유형 '{}'은 inbound, outbound, adjustment, vision_estimate 중 하나여야 합니다.",
+                    source_row, row.movement_type
+                ),
+            ));
+        }
+        if row.quantity.is_zero() {
+            return Err((StatusCode::BAD_REQUEST, format!("{}행: 거래 수량은 0일 수 없습니다. 0 수량 행은 최신 화면에서 자동 제외되어야 합니다. 화면을 새로고침하고 다시 업로드하세요.", source_row)));
+        }
+        if row.occurred_at.date_naive() > Utc::now().date_naive() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{}행: 거래일은 오늘 또는 과거 날짜여야 합니다.", source_row),
+            ));
+        }
+        if row.note.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{}행: 거래 사유(note)가 비어 있습니다.", source_row),
+            ));
+        }
+        let item = if let Some(item_id) = row.inventory_item_id {
+            items_by_id.get(&item_id)
+        } else {
+            row.item_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|item_name| items_by_name.get(&item_name.to_lowercase()))
+        }
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "inventory item is unavailable in this warehouse".to_string(),
+            )
+        })?;
+        let entered_unit = row.quantity_unit.as_deref().unwrap_or(&item.2);
+        let multiplier = unit_multiplier(
+            entered_unit,
+            &item.2,
+            item.3.as_deref(),
+            item.4,
+            item.5.as_deref(),
+            item.6,
+        )
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unit '{}' does not match item '{}'", entered_unit, item.1),
+            )
+        })?;
+        let magnitude = row.quantity.abs() * multiplier;
+        let delta = match row.movement_type.as_str() {
+            "inbound" => magnitude,
+            "outbound" => -magnitude,
+            _ => row.quantity * multiplier,
+        };
+        if let Some(anchor) = anchors.get(&item.0) {
+            if row.occurred_at >= *anchor {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{}행: '{}' 품목은 {} 이후 장부가 이미 있어 그보다 과거 거래만 가져올 수 있습니다. (거래일: {})", source_row, item.1, anchor.format("%Y-%m-%d %H:%M"), row.occurred_at.format("%Y-%m-%d %H:%M")),
+                ));
+            }
+        }
+        prepared_rows.push(PreparedMovementImportRow {
+            source_row,
+            inventory_item_id: item.0,
+            item_name: item.1.clone(),
+            occurred_at: row.occurred_at,
+            movement_type: row.movement_type,
+            quantity_delta: delta,
+            note: row.note.trim().to_string(),
+            reference: row.reference.unwrap_or_default(),
+        });
+    }
+
+    let mut duplicate_movements = Vec::new();
+    if !input.allow_duplicates {
+        let mut seen = std::collections::HashSet::new();
+        for row in &prepared_rows {
+            let key = (
+                row.inventory_item_id,
+                row.occurred_at,
+                row.movement_type.as_str(),
+                row.quantity_delta,
+            );
+            if !seen.insert(key) {
+                duplicate_movements.push(serde_json::json!({
+                    "sourceRow": row.source_row,
+                    "itemName": row.item_name,
+                    "occurredAt": row.occurred_at,
+                    "movementType": row.movement_type,
+                    "quantity": row.quantity_delta
+                }));
+            }
+        }
+
+        for chunk in prepared_rows.chunks(500) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT candidate.source_row,candidate.item_name,candidate.occurred_at,candidate.movement_type,candidate.quantity_delta FROM (",
+            );
+            query.push_values(chunk, |mut values, row| {
+                values
+                    .push_bind(row.source_row as i64)
+                    .push_bind(row.inventory_item_id)
+                    .push_bind(&row.item_name)
+                    .push_bind(&row.occurred_at)
+                    .push_bind(&row.movement_type)
+                    .push_bind(row.quantity_delta);
+            });
+            query.push(") AS candidate(source_row,inventory_item_id,item_name,occurred_at,movement_type,quantity_delta) WHERE EXISTS (SELECT 1 FROM inventory_movements m WHERE m.warehouse_id=");
+            query.push_bind(&warehouse_id);
+            query.push(" AND m.inventory_item_id=candidate.inventory_item_id AND m.created_at=candidate.occurred_at AND m.movement_type=candidate.movement_type AND m.quantity_delta=candidate.quantity_delta) OR EXISTS (SELECT 1 FROM inventory_movement_import_rows r JOIN inventory_movement_import_batches b ON b.id=r.batch_id WHERE b.warehouse_id=");
+            query.push_bind(&warehouse_id);
+            query.push(" AND b.status='PENDING' AND r.inventory_item_id=candidate.inventory_item_id AND r.occurred_at=candidate.occurred_at AND r.movement_type=candidate.movement_type AND r.quantity_delta=candidate.quantity_delta)");
+            let database_duplicates = query
+                .build_query_as::<(i64, String, DateTime<Utc>, String, Decimal)>()
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(internal_error)?;
+            for (source_row, item_name, occurred_at, movement_type, quantity) in database_duplicates
+            {
+                duplicate_movements.push(serde_json::json!({
+                    "sourceRow": source_row,
+                    "itemName": item_name,
+                    "occurredAt": occurred_at,
+                    "movementType": movement_type,
+                    "quantity": quantity
+                }));
+            }
+        }
+    }
+    if !input.allow_duplicates && !duplicate_movements.is_empty() {
+        let details =
+            serde_json::to_string(&duplicate_movements).unwrap_or_else(|_| "[]".to_string());
+        return Err((
+            StatusCode::CONFLICT,
+            format!("DUPLICATE_MOVEMENTS:{}", details),
+        ));
+    }
+    for chunk in prepared_rows.chunks(500) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO inventory_movement_import_rows (batch_id,inventory_item_id,item_name,occurred_at,movement_type,quantity_delta,note,reference) ",
+        );
+        query.push_values(chunk, |mut values, row| {
+            values
+                .push_bind(batch_id)
+                .push_bind(row.inventory_item_id)
+                .push_bind(&row.item_name)
+                .push_bind(&row.occurred_at)
+                .push_bind(&row.movement_type)
+                .push_bind(row.quantity_delta)
+                .push_bind(&row.note)
+                .push_bind(&row.reference);
+        });
+        query
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+    }
+    transaction.commit().await.map_err(internal_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            serde_json::json!({"batchId":batch_id,"status":"PENDING","rows":row_count,"createdItems":created_items}),
+        ),
+    ))
+}
+
+async fn list_inventory_ledger(
+    State(state): State<AppState>,
+    Query(query): Query<MovementQuery>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    if query.before.is_some() != query.before_id.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "before와 beforeId를 함께 지정해야 합니다.".to_string()));
+    }
+    let limit = query.limit.unwrap_or(2000).clamp(1, 50000);
+    let days = query.days.map(|value| value.clamp(1, 3650));
+    let operator = query
+        .operator
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let system_only = operator == Some("시스템");
+    let operator = operator.filter(|_| !system_only);
+    let source = query
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let movement_type = query
+        .movement_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let item = query
+        .item
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, Decimal, Decimal, String, String, Option<String>, DateTime<Utc>)>(
+                "SELECT m.id,m.inventory_item_id,m.item_name,i.unit,m.movement_type,m.quantity_delta,m.balance_after,m.note,m.source,m.actor_email,m.created_at FROM inventory_movements m
+                    JOIN inventory_items i ON i.id=m.inventory_item_id AND i.warehouse_id=m.warehouse_id
+                    WHERE m.warehouse_id=$1
+                        AND ($3::int IS NULL OR m.created_at >= now() - ($3::int * interval '1 day'))
+                        AND ($4::text IS NULL OR m.actor_email ILIKE '%' || $4 || '%')
+                        AND (NOT $5::bool OR m.actor_email IS NULL)
+                        AND ($6::text IS NULL OR m.source ILIKE $6 || '%')
+                        AND ($7::text IS NULL OR m.movement_type = $7)
+                        AND ($8::text IS NULL OR m.item_name ILIKE '%' || $8 || '%')
+                        AND ($9::uuid IS NULL OR m.inventory_item_id=$9)
+                        AND ($10::timestamptz IS NULL OR (m.created_at,m.id) < ($10,$11::uuid))
+                    ORDER BY m.created_at DESC,m.id DESC LIMIT $2",
+        ).bind(warehouse_id).bind(limit).bind(days).bind(operator).bind(system_only).bind(source).bind(movement_type).bind(item).bind(query.item_id).bind(query.before).bind(query.before_id)
+        .fetch_all(&db).await.map_err(internal_error)?;
+        Ok(Json(rows.into_iter().map(|row| serde_json::json!({"id":row.0,"inventoryItemId":row.1,"itemName":row.2,"unit":row.3,"movementType":row.4,"quantityDelta":row.5,"balanceAfter":row.6,"reason":row.7,"source":row.8,"operator":row.9,"occurredAt":row.10})).collect()))
+}
+
+async fn list_movement_imports(
+    State(state): State<AppState>,
+    Query(query): Query<MovementImportQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let warehouse_id = if user.role == "서버 관리자" {
+        query.warehouse_id
+    } else {
+        user.warehouse_id
+    };
+    let warehouse_id = warehouse_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "warehouseId is required".to_string(),
+        )
+    })?;
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let batches = sqlx::query_as::<_, (Uuid, String, String, String, i32, String, DateTime<Utc>, Option<String>, Option<DateTime<Utc>>, String)>(
+        "SELECT id,source_name,submitted_by,submitted_email,row_count,status,created_at,reviewed_email,reviewed_at,review_note FROM inventory_movement_import_batches WHERE warehouse_id=$1 ORDER BY created_at DESC LIMIT 100",
+    ).bind(warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(batches.into_iter().map(|batch| serde_json::json!({"id":batch.0,"sourceName":batch.1,"submittedBy":batch.2,"submittedEmail":batch.3,"rowCount":batch.4,"status":batch.5,"createdAt":batch.6,"reviewedEmail":batch.7,"reviewedAt":batch.8,"reviewNote":batch.9})).collect()))
+}
+
+async fn list_movement_import_rows(
+    State(state): State<AppState>,
+    Query(query): Query<ImportRowsQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let batch = sqlx::query_as::<_, (String, String, String, String, i32, DateTime<Utc>)>(
+        "SELECT warehouse_id,source_name,submitted_email,status,row_count,created_at FROM inventory_movement_import_batches WHERE id=$1",
+    ).bind(query.batch_id).fetch_optional(&db).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "가져오기 배치를 찾을 수 없습니다.".to_string()))?;
+    if user.role != "서버 관리자" && user.warehouse_id.as_deref() != Some(batch.0.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "다른 창고의 배치는 볼 수 없습니다.".to_string(),
+        ));
+    }
+    let rows = sqlx::query_as::<_, (String, DateTime<Utc>, String, Decimal, String, String)>(
+        "SELECT item_name,occurred_at,movement_type,quantity_delta,note,reference FROM inventory_movement_import_rows WHERE batch_id=$1 ORDER BY occurred_at,id LIMIT 50000",
+    ).bind(query.batch_id).fetch_all(&db).await.map_err(internal_error)?;
+    let new_items = sqlx::query_as::<_, (String, Option<String>, String, Decimal, Decimal)>(
+        "SELECT name,barcode,unit,current,safe FROM inventory_items WHERE pending_batch_id=$1 ORDER BY name",
+    ).bind(query.batch_id).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(serde_json::json!({
+        "batch": {"sourceName": batch.1, "submittedEmail": batch.2, "status": batch.3, "rowCount": batch.4, "createdAt": batch.5},
+        "newItems": new_items.into_iter().map(|item| serde_json::json!({"name":item.0,"barcode":item.1,"unit":item.2,"current":item.3,"safe":item.4})).collect::<Vec<_>>(),
+        "rows": rows.into_iter().map(|row| serde_json::json!({"itemName":row.0,"occurredAt":row.1,"movementType":row.2,"quantityDelta":row.3,"note":row.4,"reference":row.5})).collect::<Vec<_>>(),
+    })))
+}
+
+async fn generate_barcode(
+    db: &sqlx::PgPool,
+    warehouse_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    for _ in 0..10 {
+        let candidate = format!("WMS{:010}", rand::thread_rng().next_u64() % 10_000_000_000);
+        let taken = sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM inventory_items WHERE warehouse_id=$1 AND barcode=$2 AND archived_at IS NULL)")
+            .bind(warehouse_id).bind(&candidate).fetch_one(db).await.map_err(internal_error)?;
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "바코드를 생성하지 못했습니다. 다시 시도하세요.".to_string(),
+    ))
+}
+
+async fn review_movement_import(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<ReviewMovementImport>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if user.role != "관리자" && user.role != "서버 관리자" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "관리자만 과거 거래를 검토할 수 있습니다.".to_string(),
+        ));
+    }
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let batch = sqlx::query_as::<_, (String, String)>(
+        "SELECT warehouse_id,status FROM inventory_movement_import_batches WHERE id=$1 FOR UPDATE",
+    )
+    .bind(input.id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "가져오기 배치를 찾을 수 없습니다.".to_string(),
+        )
+    })?;
+    if user.role != "서버 관리자" && user.warehouse_id.as_deref() != Some(batch.0.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "다른 창고의 거래는 검토할 수 없습니다.".to_string(),
+        ));
+    }
+    if batch.1 != "PENDING" {
+        return Err((
+            StatusCode::CONFLICT,
+            "이미 검토된 가져오기 배치입니다.".to_string(),
+        ));
+    }
+    let review_note = input
+        .note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(if input.approve {
+            "관리자 승인"
+        } else {
+            "관리자 반려"
+        });
+    if input.approve {
+        let mut approved_movements = Vec::new();
+        let mut balance_updates = Vec::new();
+        let pending_items = sqlx::query_as::<_, (Uuid, String, Decimal, Decimal, String)>("SELECT id,name,current,safe,unit FROM inventory_items WHERE pending_batch_id=$1 FOR UPDATE")
+            .bind(input.id).fetch_all(&mut *transaction).await.map_err(internal_error)?;
+        for (item_id, item_name, current, safe, unit) in pending_items {
+            sqlx::query("UPDATE inventory_items SET archived_at=NULL,pending_batch_id=NULL,updated_at=now() WHERE id=$1")
+                .bind(item_id).execute(&mut *transaction).await.map_err(|error| {
+                    if error.as_database_error().is_some_and(|db_error| db_error.is_unique_violation()) {
+                        (StatusCode::CONFLICT, format!("'{}' 품목의 바코드가 이미 다른 품목에 사용 중이라 승인할 수 없습니다.", item_name))
+                    } else { internal_error(error) }
+                })?;
+            sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email) VALUES ($1,$2,$3,'initial',$4,$4,'Excel initial stock','historical_import',$5,$6)")
+                .bind(&batch.0).bind(item_id).bind(&item_name).bind(current).bind(&user.id).bind(&user.email)
+                .execute(&mut *transaction).await.map_err(internal_error)?;
+            sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,after_data,reason,source) VALUES ($1,$2,$3,'create','inventory_item',$4,$5,'Excel initial stock','historical_import')")
+                .bind(&batch.0).bind(&user.id).bind(&user.email).bind(item_id.to_string())
+                .bind(serde_json::json!({"name":item_name,"current":current,"safe":safe,"unit":unit}))
+                .execute(&mut *transaction).await.map_err(internal_error)?;
+        }
+        let rows = sqlx::query_as::<_, (Uuid, String, DateTime<Utc>, String, Decimal, String, String)>("SELECT inventory_item_id,item_name,occurred_at,movement_type,quantity_delta,note,reference FROM inventory_movement_import_rows WHERE batch_id=$1 ORDER BY inventory_item_id,occurred_at,id")
+            .bind(input.id).fetch_all(&mut *transaction).await.map_err(internal_error)?;
+        let mut grouped: std::collections::BTreeMap<
+            Uuid,
+            Vec<(String, DateTime<Utc>, String, Decimal, String, String)>,
+        > = std::collections::BTreeMap::new();
+        for row in rows {
+            grouped
+                .entry(row.0)
+                .or_default()
+                .push((row.1, row.2, row.3, row.4, row.5, row.6));
+        }
+        for (item_id, item_rows) in grouped {
+            let item_label = item_rows
+                .first()
+                .map(|row| row.0.clone())
+                .unwrap_or_default();
+            let archived_item = sqlx::query_as::<_, (Option<DateTime<Utc>>, Decimal)>(
+                "SELECT archived_at,current FROM inventory_items WHERE id=$1 AND warehouse_id=$2 FOR UPDATE",
+            )
+            .bind(item_id)
+            .bind(&batch.0)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("'{}' 품목을 찾을 수 없습니다.", item_label)))?;
+
+            if let Some(archived_at) = archived_item.0 {
+                if let Some(late) = item_rows.iter().find(|row| row.1 >= archived_at) {
+                    return Err((StatusCode::CONFLICT, format!("'{}' 품목은 보관 시점 이후 거래를 가져올 수 없습니다. (보관 시점: {}, 문제 거래일: {})", item_label, archived_at.format("%Y-%m-%d %H:%M"), late.1.format("%Y-%m-%d %H:%M"))));
+                }
+
+                let baseline = match sqlx::query_as::<_, (DateTime<Utc>, Decimal)>("SELECT created_at,balance_after FROM inventory_movements WHERE inventory_item_id=$1 AND movement_type='initial' ORDER BY created_at,id LIMIT 1")
+                    .bind(item_id).fetch_optional(&mut *transaction).await.map_err(internal_error)? {
+                    Some(found) => found,
+                    None => sqlx::query_as::<_, (DateTime<Utc>, Decimal)>("SELECT created_at,balance_after FROM inventory_movements WHERE inventory_item_id=$1 ORDER BY created_at,id LIMIT 1")
+                        .bind(item_id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+                        .ok_or_else(|| (StatusCode::CONFLICT, format!("'{}' 품목에 기준 장부가 없어 가져올 수 없습니다.", item_label)))?,
+                };
+                let archive = sqlx::query_as::<_, (Uuid, DateTime<Utc>, Decimal, Decimal)>(
+                    "SELECT id,created_at,quantity_delta,balance_after FROM inventory_movements WHERE inventory_item_id=$1 AND source='archive' ORDER BY created_at DESC,id DESC LIMIT 1",
+                )
+                .bind(item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(internal_error)?;
+                let archive_at = archive.as_ref().map(|row| row.1).unwrap_or(archived_at);
+
+                let existing_before = sqlx::query_as::<_, (Uuid, DateTime<Utc>, Decimal)>("SELECT id,created_at,quantity_delta FROM inventory_movements WHERE inventory_item_id=$1 AND created_at<$2 ORDER BY created_at,id")
+                    .bind(item_id).bind(baseline.0).fetch_all(&mut *transaction).await.map_err(internal_error)?;
+                let mut before_timeline: Vec<(DateTime<Utc>, Option<Uuid>, usize, Decimal)> =
+                    existing_before
+                        .iter()
+                        .map(|row| (row.1, Some(row.0), 0, row.2))
+                        .collect();
+                for (index, row) in item_rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.1 < baseline.0)
+                {
+                    before_timeline.push((row.1, None, index, row.3));
+                }
+                before_timeline.sort_by(|left, right| {
+                    left.0
+                        .cmp(&right.0)
+                        .then(left.1.is_none().cmp(&right.1.is_none()))
+                });
+                let before_deltas = before_timeline
+                    .iter()
+                    .map(|entry| entry.3)
+                    .collect::<Vec<_>>();
+                let (_, before_balances) = match rebuild_movement_balances(
+                    baseline.1,
+                    &before_deltas,
+                ) {
+                    Ok(result) => result,
+                    Err(None) => {
+                        let opening = baseline.1 - before_deltas.iter().copied().sum::<Decimal>();
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!(
+                                "'{}' 품목: 가져온 거래를 역산하면 기초 재고가 음수({})가 됩니다.",
+                                item_label,
+                                opening.round_dp(2).normalize()
+                            ),
+                        ));
+                    }
+                    Err(Some(index)) => {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!(
+                                "'{}' 품목: {} 시점에 재고가 음수가 되는 거래가 있습니다.",
+                                item_label,
+                                before_timeline[index].0.format("%Y-%m-%d %H:%M")
+                            ),
+                        ))
+                    }
+                };
+                for ((_at, existing_id, index, _), balance) in
+                    before_timeline.into_iter().zip(before_balances)
+                {
+                    if let Some(existing_id) = existing_id {
+                        balance_updates.push((existing_id, balance));
+                    } else {
+                        let row = &item_rows[index];
+                        approved_movements.push(ApprovedMovementInsert {
+                            warehouse_id: batch.0.clone(),
+                            item_id,
+                            item_name: row.0.clone(),
+                            movement_type: row.2.clone(),
+                            quantity_delta: row.3,
+                            balance_after: balance,
+                            note: format!(
+                                "{}{}",
+                                row.4,
+                                if row.5.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (참조: {})", row.5)
+                                }
+                            ),
+                            source: format!("historical_import:{}", input.id),
+                            actor_id: user.id.clone(),
+                            actor_email: user.email.clone(),
+                            occurred_at: row.1,
+                        });
+                    }
+                }
+
+                let existing_after = sqlx::query_as::<_, (Uuid, DateTime<Utc>, Decimal)>("SELECT id,created_at,quantity_delta FROM inventory_movements WHERE inventory_item_id=$1 AND created_at >= $2 AND created_at < $3 AND movement_type<>'initial' AND source<>'archive' ORDER BY created_at,id")
+                    .bind(item_id).bind(baseline.0).bind(archive_at).fetch_all(&mut *transaction).await.map_err(internal_error)?;
+                let mut after_timeline: Vec<(DateTime<Utc>, Option<Uuid>, usize, Decimal)> =
+                    existing_after
+                        .iter()
+                        .map(|row| (row.1, Some(row.0), 0, row.2))
+                        .collect();
+                for (index, row) in item_rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.1 >= baseline.0)
+                {
+                    after_timeline.push((row.1, None, index, row.3));
+                }
+                after_timeline.sort_by(|left, right| {
+                    left.0
+                        .cmp(&right.0)
+                        .then(left.1.is_none().cmp(&right.1.is_none()))
+                });
+                let after_deltas = after_timeline
+                    .iter()
+                    .map(|entry| entry.3)
+                    .collect::<Vec<_>>();
+                let (remaining_balance, after_balances) =
+                    replay_movement_balances(baseline.1, &after_deltas).map_err(|index| {
+                        (
+                            StatusCode::CONFLICT,
+                            format!(
+                                "'{}' 품목: {} 시점에 재고가 음수가 되는 거래가 있습니다.",
+                                item_label,
+                                after_timeline[index].0.format("%Y-%m-%d %H:%M")
+                            ),
+                        )
+                    })?;
+                for ((_at, existing_id, index, _), balance) in
+                    after_timeline.into_iter().zip(after_balances)
+                {
+                    if let Some(existing_id) = existing_id {
+                        balance_updates.push((existing_id, balance));
+                    } else {
+                        let row = &item_rows[index];
+                        approved_movements.push(ApprovedMovementInsert {
+                            warehouse_id: batch.0.clone(),
+                            item_id,
+                            item_name: row.0.clone(),
+                            movement_type: row.2.clone(),
+                            quantity_delta: row.3,
+                            balance_after: balance,
+                            note: format!(
+                                "{}{}",
+                                row.4,
+                                if row.5.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (참조: {})", row.5)
+                                }
+                            ),
+                            source: format!("historical_import:{}", input.id),
+                            actor_id: user.id.clone(),
+                            actor_email: user.email.clone(),
+                            occurred_at: row.1,
+                        });
+                    }
+                }
+                if let Some((archive_id, _, _, _)) = archive {
+                    sqlx::query("UPDATE inventory_movements SET quantity_delta=$1,balance_after=0,note=note || ' (과거 거래 승인 후 잔액 재계산)' WHERE id=$2")
+                        .bind(-remaining_balance).bind(archive_id).execute(&mut *transaction).await.map_err(internal_error)?;
+                } else if remaining_balance > Decimal::ZERO {
+                    sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email,created_at) VALUES ($1,$2,$3,'adjustment',$4,0,'보관 품목의 과거 장부 승인 후 잔량 정리','archive_reconciliation',$5,$6,$7)")
+                        .bind(&batch.0).bind(item_id).bind(&item_label).bind(-remaining_balance).bind(&user.id).bind(&user.email).bind(archived_at)
+                        .execute(&mut *transaction).await.map_err(internal_error)?;
+                }
+                continue;
+            }
+
+            // 기준 장부는 품목 등록 시점의 initial 이동이다. 이전 가져오기로 추가된 과거 행도 함께 다시 계산한다.
+            let baseline = match sqlx::query_as::<_, (DateTime<Utc>, Decimal)>("SELECT created_at,balance_after FROM inventory_movements WHERE inventory_item_id=$1 AND movement_type='initial' ORDER BY created_at,id LIMIT 1")
+                .bind(item_id).fetch_optional(&mut *transaction).await.map_err(internal_error)? {
+                Some(found) => found,
+                None => sqlx::query_as::<_, (DateTime<Utc>, Decimal)>("SELECT created_at,balance_after FROM inventory_movements WHERE inventory_item_id=$1 ORDER BY created_at,id LIMIT 1")
+                    .bind(item_id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+                    .ok_or_else(|| (StatusCode::CONFLICT, format!("'{}' 품목에 기준 장부가 없어 가져올 수 없습니다.", item_label)))?,
+            };
+            if let Some(late) = item_rows.iter().find(|row| row.1 >= baseline.0) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("'{}' 품목은 {} 이후 장부가 이미 있어 그보다 과거 거래만 가져올 수 있습니다. (문제 거래일: {})", item_label, baseline.0.format("%Y-%m-%d %H:%M"), late.1.format("%Y-%m-%d %H:%M")),
+                ));
+            }
+            let existing_before = sqlx::query_as::<_, (Uuid, DateTime<Utc>, Decimal)>("SELECT id,created_at,quantity_delta FROM inventory_movements WHERE inventory_item_id=$1 AND created_at<$2 ORDER BY created_at,id")
+                .bind(item_id).bind(baseline.0).fetch_all(&mut *transaction).await.map_err(internal_error)?;
+            // (타임스킬프, 기존 행 id 또는 신규 행 인덱스, 증감)
+            let mut timeline: Vec<(DateTime<Utc>, Option<Uuid>, usize, Decimal)> = existing_before
+                .iter()
+                .map(|row| (row.1, Some(row.0), 0, row.2))
+                .collect();
+            for (index, row) in item_rows.iter().enumerate() {
+                timeline.push((row.1, None, index, row.3));
+            }
+            timeline.sort_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then(left.1.is_none().cmp(&right.1.is_none()))
+            });
+            let total_delta = timeline.iter().map(|entry| entry.3).sum::<Decimal>();
+            let mut balance = baseline.1 - total_delta;
+            if balance < Decimal::ZERO {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("'{}' 품목: 가져온 내역을 역산하면 기초 재고가 음수({})가 됩니다. 입고/출고 수량이나 기초재고를 확인하세요.", item_label, balance.round_dp(2).normalize()),
+                ));
+            }
+            for (moved_at, existing_id, index, delta) in timeline {
+                balance += delta;
+                if balance < Decimal::ZERO {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "'{}' 품목: {} 시점에 재고가 음수가 되는 거래가 있습니다.",
+                            item_label,
+                            moved_at.format("%Y-%m-%d")
+                        ),
+                    ));
+                }
+                if let Some(existing_id) = existing_id {
+                    balance_updates.push((existing_id, balance));
+                } else {
+                    let row = &item_rows[index];
+                    approved_movements.push(ApprovedMovementInsert {
+                        warehouse_id: batch.0.clone(),
+                        item_id,
+                        item_name: row.0.clone(),
+                        movement_type: row.2.clone(),
+                        quantity_delta: row.3,
+                        balance_after: balance,
+                        note: format!(
+                            "{}{}",
+                            row.4,
+                            if row.5.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (참조: {})", row.5)
+                            }
+                        ),
+                        source: format!("historical_import:{}", input.id),
+                        actor_id: user.id.clone(),
+                        actor_email: user.email.clone(),
+                        occurred_at: row.1,
+                    });
+                }
+            }
+            if balance != baseline.1 {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("'{}' 품목: 과거 거래 잔액 검증에 실패했습니다.", item_label),
+                ));
+            }
+        }
+        apply_approved_movement_changes(&mut transaction, &approved_movements, &balance_updates)
+            .await
+            .map_err(internal_error)?;
+    }
+    let status = if input.approve {
+        "APPROVED"
+    } else {
+        "REJECTED"
+    };
+    sqlx::query("UPDATE inventory_movement_import_batches SET status=$1,reviewed_by=$2,reviewed_email=$3,reviewed_at=now(),review_note=$4 WHERE id=$5")
+        .bind(status).bind(&user.id).bind(&user.email).bind(review_note).bind(input.id).execute(&mut *transaction).await.map_err(internal_error)?;
+    sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,after_data,reason,source) VALUES ($1,$2,$3,$4,'movement_import_batch',$5,$6,$7,'historical_import')")
+        .bind(&batch.0).bind(&user.id).bind(&user.email).bind(status.to_lowercase()).bind(input.id.to_string()).bind(serde_json::json!({"status":status})).bind(review_note)
+        .execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    Ok(Json(
+        serde_json::json!({"success":true,"status":status,"batchId":input.id}),
+    ))
+}
+
+async fn list_inventory_movements(
+    State(state): State<AppState>,
+    Query(query): Query<MovementQuery>,
+) -> Result<Json<Vec<InventoryMovementDay>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let days = query.days.unwrap_or(30).clamp(1, 365);
+    let rows = sqlx::query_as::<_, InventoryMovementDay>(
+        "SELECT day::date AS day,
+                COALESCE(SUM(CASE WHEN m.movement_type = 'inbound' THEN m.quantity_delta ELSE 0 END), 0)::numeric AS inbound,
+                COALESCE(SUM(CASE WHEN m.movement_type = 'outbound' THEN -m.quantity_delta ELSE 0 END), 0)::numeric AS outbound,
+                COALESCE(SUM(CASE WHEN m.movement_type IN ('adjustment', 'vision_estimate') THEN m.quantity_delta ELSE 0 END), 0)::numeric AS adjustments,
+                  COUNT(m.id) FILTER (WHERE m.movement_type <> 'initial')::bigint AS movement_count
+              FROM generate_series(current_date - ($2::int - 1), current_date, interval '1 day') AS calendar(day)
+              LEFT JOIN inventory_movements m ON m.warehouse_id = $1 AND m.created_at >= calendar.day AND m.created_at < calendar.day + interval '1 day'
+         GROUP BY day ORDER BY day",
+    ).bind(warehouse_id).bind(days).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+fn demand_features(
+    histories: &[Vec<(chrono::NaiveDate, Decimal)>],
+    item_index: usize,
+    end_index: usize,
+) -> Option<(Vec<f64>, f64)> {
+    let history = histories.get(item_index)?;
+    let end = end_index.min(history.len());
+    if end < FORECAST_LOOKBACK_DAYS {
+        return None;
+    }
+    let values = history[end - FORECAST_LOOKBACK_DAYS..end]
+        .iter()
+        .map(|(_, quantity)| quantity.to_f64())
+        .collect::<Option<Vec<_>>>()?;
+    let scale = (values.iter().sum::<f64>() / FORECAST_LOOKBACK_DAYS as f64).max(1.0);
+    let mut features = Vec::with_capacity(histories.len() + 26);
+    features.extend((0..histories.len()).map(|index| f64::from(index == item_index)));
+    for lag in [1_usize, 7, 14, 28, 56, 90] {
+        features.push(values[FORECAST_LOOKBACK_DAYS - lag] / scale);
+    }
+    for window in [7_usize, 14, 28, 56, 90] {
+        let sample = &values[FORECAST_LOOKBACK_DAYS - window..];
+        features.push(sample.iter().sum::<f64>() / scale);
+    }
+    let last_28 = &values[FORECAST_LOOKBACK_DAYS - 28..];
+    let mean_28 = last_28.iter().sum::<f64>() / 28.0;
+    let std_28 = (last_28.iter().map(|value| (value - mean_28).powi(2)).sum::<f64>() / 28.0).sqrt();
+    features.push(std_28 / scale);
+    features.push(values.iter().filter(|value| **value > 0.0).count() as f64 / FORECAST_LOOKBACK_DAYS as f64);
+    features.push(scale.ln_1p());
+    let forecast_date = if end < history.len() {
+        history[end].0
+    } else {
+        history.last()?.0 + chrono::Duration::days(1)
+    };
+    let year_position = forecast_date.ordinal0() as f64 / 365.25;
+    let weekday_position = forecast_date.weekday().num_days_from_monday() as f64 / 7.0;
+    let month_position = (forecast_date.month0() as f64 + 0.5) / 12.0;
+    for position in [year_position, weekday_position, month_position] {
+        features.push((std::f64::consts::TAU * position).sin());
+        features.push((std::f64::consts::TAU * position).cos());
+    }
+    Some((features, scale))
+}
+
+fn fit_demand_forest(features: &[Vec<f64>], targets: &[f64]) -> Option<DemandForest> {
+    if features.len() < FORECAST_MIN_TRAINING_SAMPLES || features.len() != targets.len() {
+        return None;
+    }
+    let matrix = DenseMatrix::from_2d_vec(&features.to_vec()).ok()?;
+    RandomForestRegressor::fit(
+        &matrix,
+        &targets.to_vec(),
+        RandomForestRegressorParameters::default()
+            .with_n_trees(48)
+            .with_max_depth(10)
+            .with_min_samples_leaf(3)
+            .with_seed(42),
+    )
+    .ok()
+}
+
+fn evaluate_demand_forest(
+    histories: &[Vec<(chrono::NaiveDate, Decimal)>],
+    horizon: usize,
+) -> ForecastModelResult {
+    let mut train_features = Vec::new();
+    let mut train_targets = Vec::new();
+    let mut validation_features = Vec::new();
+    let mut validation_actual = Vec::new();
+    let mut validation_baseline = Vec::new();
+    let mut validation_items = Vec::new();
+
+    for (item_index, history) in histories.iter().enumerate() {
+        let validation_days = FORECAST_VALIDATION_DAYS.min(
+            history.len().saturating_sub(FORECAST_LOOKBACK_DAYS + horizon),
+        );
+        let split_index = history.len().saturating_sub(validation_days);
+        for end_index in (FORECAST_LOOKBACK_DAYS..=split_index.saturating_sub(horizon))
+            .step_by(FORECAST_ORIGIN_STEP_DAYS)
+        {
+            let Some((features, scale)) = demand_features(histories, item_index, end_index) else {
+                continue;
+            };
+            let actual = history[end_index..end_index + horizon]
+                .iter()
+                .map(|(_, value)| value.to_f64())
+                .collect::<Option<Vec<_>>>();
+            let Some(actual) = actual else { continue };
+            train_features.push(features);
+            train_targets.push(actual.iter().sum::<f64>() / scale);
+        }
+        if validation_days == 0 {
+            continue;
+        }
+        for end_index in (split_index..=history.len().saturating_sub(horizon))
+            .step_by(horizon.max(1))
+        {
+            let Some((features, scale)) = demand_features(histories, item_index, end_index) else {
+                continue;
+            };
+            let actual = history[end_index..end_index + horizon]
+                .iter()
+                .map(|(_, value)| value.to_f64())
+                .collect::<Option<Vec<_>>>();
+            let baseline = history[end_index.saturating_sub(28)..end_index]
+                .iter()
+                .map(|(_, value)| value.to_f64())
+                .collect::<Option<Vec<_>>>();
+            let (Some(actual), Some(baseline)) = (actual, baseline) else { continue };
+            validation_features.push((features, scale));
+            validation_actual.push(actual.iter().sum::<f64>());
+            validation_baseline.push(baseline.iter().sum::<f64>() / baseline.len() as f64 * horizon as f64);
+            validation_items.push(item_index);
+        }
+    }
+
+    let mut item_error = vec![0.0; histories.len()];
+    let mut item_baseline_error = vec![0.0; histories.len()];
+    let mut item_actual = vec![0.0; histories.len()];
+    let mut item_samples = vec![0; histories.len()];
+    let mut ai_error = 0.0;
+    let mut baseline_error = 0.0;
+    let mut actual_volume = 0.0;
+    let mut final_features = Vec::new();
+    let mut final_targets = Vec::new();
+    for (item_index, history) in histories.iter().enumerate() {
+        for end_index in (FORECAST_LOOKBACK_DAYS..history.len().saturating_sub(horizon) + 1)
+            .step_by(FORECAST_ORIGIN_STEP_DAYS)
+        {
+            let Some((features, scale)) = demand_features(histories, item_index, end_index) else {
+                continue;
+            };
+            let Some(actual) = history[end_index..end_index + horizon]
+                .iter()
+                .map(|(_, value)| value.to_f64())
+                .collect::<Option<Vec<_>>>()
+            else { continue };
+            final_features.push(features);
+            final_targets.push(actual.iter().sum::<f64>() / scale);
+        }
+    }
+
+    let validation_model = fit_demand_forest(&train_features, &train_targets);
+    if let Some(model) = validation_model {
+        let features = validation_features.iter().map(|(row, _)| row.clone()).collect::<Vec<_>>();
+        if let Ok(matrix) = DenseMatrix::from_2d_vec(&features) {
+            if let Ok(predictions) = model.predict(&matrix) {
+                for (index, prediction) in predictions.iter().enumerate() {
+                    let predicted = (prediction.max(0.0) * validation_features[index].1).max(0.0);
+                    let actual = validation_actual[index];
+                    let baseline = validation_baseline[index];
+                    ai_error += (predicted - actual).abs();
+                    baseline_error += (baseline - actual).abs();
+                    actual_volume += actual;
+                    let item_index = validation_items[index];
+                    item_error[item_index] += (predicted - actual).abs();
+                    item_baseline_error[item_index] += (baseline - actual).abs();
+                    item_actual[item_index] += actual;
+                    item_samples[item_index] += 1;
+                }
+            }
+        }
+    }
+
+    let final_model = fit_demand_forest(&final_features, &final_targets);
+    let mut predictions = vec![None; histories.len()];
+    let mut baseline_predictions = vec![None; histories.len()];
+    for (item_index, history) in histories.iter().enumerate() {
+        if history.len() >= 28 {
+            let baseline = history.iter().rev().take(28).map(|(_, value)| *value).sum::<Decimal>()
+                * Decimal::from(horizon as u64) / Decimal::from(28u32);
+            baseline_predictions[item_index] = Some(baseline);
+        }
+    }
+    if let Some(model) = final_model {
+        let latest_features = histories
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| demand_features(histories, index, histories[index].len()).map(|(features, scale)| (index, features, scale)))
+            .collect::<Vec<_>>();
+        let matrix_data = latest_features.iter().map(|(_, features, _)| features.clone()).collect::<Vec<_>>();
+        if let Ok(matrix) = DenseMatrix::from_2d_vec(&matrix_data) {
+            if let Ok(model_predictions) = model.predict(&matrix) {
+                for ((item_index, _, scale), prediction) in latest_features.into_iter().zip(model_predictions) {
+                    let value = (prediction.max(0.0) * scale).max(0.0);
+                    predictions[item_index] = Decimal::from_f64_retain(value)
+                        .map(|quantity| quantity.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToPositiveInfinity));
+                }
+            }
+        }
+    }
+
+    let wape = (actual_volume > 0.0).then(|| Decimal::from_f64_retain(ai_error / actual_volume * 100.0)).flatten();
+    let baseline_wape = (actual_volume > 0.0).then(|| Decimal::from_f64_retain(baseline_error / actual_volume * 100.0)).flatten();
+    let relative_improvement = match (wape, baseline_wape) {
+        (Some(model), Some(baseline)) if baseline > Decimal::ZERO => Some((baseline - model) * Decimal::from(100u32) / baseline),
+        _ => None,
+    };
+    ForecastModelResult {
+        predictions,
+        baseline_predictions,
+        item_wape: item_error.iter().zip(item_actual.iter()).map(|(error, actual)| {
+            (*actual > 0.0).then(|| Decimal::from_f64_retain(error / actual * 100.0)).flatten()
+        }).collect(),
+        item_baseline_wape: item_baseline_error.iter().zip(item_actual.iter()).map(|(error, actual)| {
+            (*actual > 0.0).then(|| Decimal::from_f64_retain(error / actual * 100.0)).flatten()
+        }).collect(),
+        item_samples,
+        wape,
+        baseline_wape,
+        relative_improvement,
+        sample_count: validation_actual.len(),
+        actual_volume: Decimal::from_f64_retain(actual_volume).unwrap_or(Decimal::ZERO),
+    }
+}
+
+async fn list_inventory_forecast(
+    State(state): State<AppState>,
+    Query(query): Query<ForecastQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    const HOLDOUT_DAYS: usize = 7;
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let history_days = query.history_days.unwrap_or(1095).clamp(35, 1095);
+    let model_history_days = history_days.max((FORECAST_LOOKBACK_DAYS + FORECAST_VALIDATION_DAYS + 1) as i32);
+    let rows = sqlx::query_as::<_, (Uuid, String, String, Decimal, String, bool, i32, Decimal, chrono::NaiveDate, Decimal)>(
+        "WITH item_coverage AS (
+            SELECT i.id, i.name, i.unit, i.safe, i.safety_stock_mode, i.safety_stock_prompted, i.safety_stock_lead_time_days, i.safety_stock_service_level,
+                   COALESCE(MIN(m.created_at)::date, i.created_at::date) AS coverage_start
+              FROM inventory_items i
+              LEFT JOIN inventory_movements m ON m.inventory_item_id = i.id
+             WHERE i.warehouse_id = $1 AND i.archived_at IS NULL
+             GROUP BY i.id
+         )
+         SELECT c.id, c.name, c.unit, c.safe, c.safety_stock_mode, c.safety_stock_prompted, c.safety_stock_lead_time_days, c.safety_stock_service_level, calendar.day::date AS day,
+                COALESCE(SUM(CASE WHEN m.movement_type = 'outbound' THEN -m.quantity_delta ELSE 0 END), 0)::numeric AS outbound
+           FROM item_coverage c
+           CROSS JOIN LATERAL generate_series(
+               GREATEST(c.coverage_start, current_date - ($2::int - 1)),
+               current_date - interval '1 day',
+               interval '1 day'
+           ) AS calendar(day)
+           LEFT JOIN inventory_movements m ON m.inventory_item_id = c.id
+                AND m.created_at >= calendar.day
+                AND m.created_at < calendar.day + interval '1 day'
+          GROUP BY c.id, c.name, c.unit, c.safe, c.safety_stock_mode, c.safety_stock_prompted, c.safety_stock_lead_time_days, c.safety_stock_service_level, calendar.day
+          ORDER BY c.name, calendar.day",
+    ).bind(&warehouse_id).bind(model_history_days).fetch_all(&db).await.map_err(internal_error)?;
+
+    let mut grouped: std::collections::BTreeMap<
+        Uuid,
+        (
+            String,
+            String,
+            Decimal,
+            String,
+            bool,
+            i32,
+            Decimal,
+            Vec<(chrono::NaiveDate, Decimal)>,
+        ),
+    > = std::collections::BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry(row.0)
+            .or_insert_with(|| (row.1, row.2, row.3, row.4, row.5, row.6, row.7, Vec::new()))
+            .7
+                .push((row.8, row.9));
+    }
+
+    let grouped = grouped.into_iter().map(|(id, item)| (id, item)).collect::<Vec<_>>();
+    let horizons = [1_usize, 7, 30];
+    let items = grouped.iter().map(|(id, (name, unit, safe, safety_stock_mode, safety_stock_prompted, lead_time_days, service_level, daily_outbound))| {
+        let values = daily_outbound.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        let history_count = values.len();
+        let safety_stock_history_days = values.len().min(180);
+        let outbound_days = daily_outbound.iter().rev().take(180).filter(|entry| entry.1 > Decimal::ZERO).count();
+        let safety_stock_eligible = safety_stock_data_is_eligible(safety_stock_history_days, outbound_days);
+        let safety_history = values.clone();
+        let suggested_safe = if safety_stock_eligible {
+            calculate_safety_stock(&safety_history, *lead_time_days, *service_level)
+        } else { None };
+
+        let baseline_window = 28usize.min(values.len());
+        let baseline_daily = if baseline_window == 0 {
+            Decimal::ZERO
+        } else {
+            values[values.len() - baseline_window..].iter().copied().sum::<Decimal>() / Decimal::from(baseline_window as u64)
+        };
+
+        let forecast_1d = baseline_daily;
+        let forecast_7d = baseline_daily * Decimal::from(7u64);
+        let forecast_30d = baseline_daily * Decimal::from(30u64);
+
+        let mut wape_error = Decimal::ZERO;
+        let mut wape_actual = Decimal::ZERO;
+        let mut sample_count = 0_usize;
+        let holdout_slice = values.iter().rev().take(180).collect::<Vec<_>>();
+        let holdout_values = holdout_slice.iter().rev().copied().copied().collect::<Vec<_>>();
+        if holdout_values.len() >= 28 {
+            for start in (28..=holdout_values.len().saturating_sub(7)).step_by(7) {
+                let recent = &holdout_values[start - 28..start];
+                let recent_average = recent.iter().copied().sum::<Decimal>() / Decimal::from(28u64);
+                let actual = holdout_values[start..start + 7].iter().copied().sum::<Decimal>();
+                if actual > Decimal::ZERO {
+                    wape_error += (recent_average * Decimal::from(7u64) - actual).abs();
+                    wape_actual += actual;
+                    sample_count += 1;
+                }
+            }
+        }
+        let wape_pct = if wape_actual > Decimal::ZERO {
+            Some(wape_error / wape_actual * Decimal::from(100u32))
+        } else {
+            None
+        };
+
+        serde_json::json!({
+            "itemId": id,
+            "itemName": name,
+            "unit": unit,
+            "safe": safe,
+            "historyDays": history_count,
+            "safetyStockHistoryDays": safety_stock_history_days,
+            "outboundDays": outbound_days,
+            "safetyStockMode": safety_stock_mode,
+            "safetyStockPrompted": safety_stock_prompted,
+            "safetyStockLeadTimeDays": lead_time_days,
+            "safetyStockServiceLevel": service_level,
+            "safetyStockEligible": safety_stock_eligible,
+            "suggestedSafetyStock": suggested_safe,
+            "safetyStockFormula": "Z × σ(daily outbound, up to 180 complete days) × √(lead time days)",
+            "forecastStatus": if !values.is_empty() { "forecast_available" } else { "insufficient_data" },
+            "forecastOutflow1d": Some(forecast_1d),
+            "forecastOutflow7d": Some(forecast_7d),
+            "forecastOutflow30d": Some(forecast_30d),
+            "baselineOutflow1d": Some(forecast_1d),
+            "baselineOutflow7d": Some(forecast_7d),
+            "baselineOutflow30d": Some(forecast_30d),
+            "wapePct": wape_pct,
+            "baselineWapePct": wape_pct,
+            "validationSamples": sample_count,
+        })
+    }).collect::<Vec<_>>();
+
+    let horizon_backtests = horizons.iter().map(|horizon| {
+        let mut total_error = Decimal::ZERO;
+        let mut total_actual = Decimal::ZERO;
+        let mut sample_count = 0_usize;
+        for (_, (_, _, _, _, _, _, _, daily_outbound)) in &grouped {
+            let values = daily_outbound.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+            let holdout_values = values.iter().rev().take(180).copied().rev().collect::<Vec<_>>();
+            if holdout_values.len() < 28 {
+                continue;
+            }
+            let step = (*horizon).max(1);
+            for start in (28..=holdout_values.len().saturating_sub(*horizon)).step_by(step) {
+                let recent = &holdout_values[start - 28..start];
+                let recent_average = recent.iter().copied().sum::<Decimal>() / Decimal::from(28u64);
+                let actual = holdout_values[start..start + *horizon].iter().copied().sum::<Decimal>();
+                if actual > Decimal::ZERO {
+                    total_error += (recent_average * Decimal::from(*horizon as u64) - actual).abs();
+                    total_actual += actual;
+                    sample_count += 1;
+                }
+            }
+        }
+        let wape_pct = if total_actual > Decimal::ZERO {
+            Some(total_error / total_actual * Decimal::from(100u32))
+        } else {
+            None
+        };
+        serde_json::json!({
+            "horizonDays": horizon,
+            "sampleCount": sample_count,
+            "wapePct": wape_pct,
+            "baselineWapePct": wape_pct,
+            "relativeImprovementPct": Decimal::ZERO,
+            "forecastVolume": total_actual
+        })
+    }).collect::<Vec<_>>();
+
+    let seven_day_wape = horizon_backtests.iter().find(|entry| entry["horizonDays"] == 7).and_then(|entry| entry["wapePct"].as_i64().map(|_| entry["wapePct"].clone()));
+    let sufficient = horizon_backtests.iter().any(|entry| entry["sampleCount"].as_u64().unwrap_or(0) > 0);
+    Ok(Json(serde_json::json!({
+        "model": "28-day moving-average baseline",
+        "modelType": "baseline_regression",
+        "baselineModel": "28-day moving-average",
+        "forecastHorizonDays": HOLDOUT_DAYS,
+        "backtestHorizonDays": HOLDOUT_DAYS,
+        "minimumHistoryDays": 35,
+        "historyDaysRequested": history_days,
+        "horizonBacktests": horizon_backtests,
+        "status": if sufficient { "measured" } else { "insufficient_data" },
+        "lookbackDays": 28,
+        "validationWindowDays": 180,
+        "validationStepDays": 7,
+        "minimumTrainingSamples": 28,
+        "itemsWithEvaluableWape": items.iter().filter(|item| item["validationSamples"].as_u64().unwrap_or(0) > 0).count(),
+        "validationSamples": horizon_backtests.iter().find(|entry| entry["horizonDays"] == 7).and_then(|entry| entry["sampleCount"].as_u64()).unwrap_or(0),
+        "wapePct": horizon_backtests.iter().find(|entry| entry["horizonDays"] == 7).and_then(|entry| entry["wapePct"].as_f64().map(|value| Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO))).unwrap_or(Decimal::ZERO),
+        "baselineWapePct": horizon_backtests.iter().find(|entry| entry["horizonDays"] == 7).and_then(|entry| entry["baselineWapePct"].as_f64().map(|value| Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO))).unwrap_or(Decimal::ZERO),
+        "relativeImprovementPct": Decimal::ZERO,
+        "stockoutRatePct": Value::Null,
+        "stockoutMetricStatus": "not_measurable",
+        "stockoutMetricReason": "품절로 처리하지 못한 주문이나 출고 요청이 기록되지 않아 출고 장부만으로는 품절률을 계산할 수 없습니다.",
+        "items": items
+    })))
+}
+
+async fn load_safety_stock_history(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    item_id: Uuid,
+) -> Result<Vec<Decimal>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, Decimal>(
+        "WITH coverage AS (
+            SELECT COALESCE(MIN(m.created_at)::date, i.created_at::date) AS starts
+              FROM inventory_items i LEFT JOIN inventory_movements m ON m.inventory_item_id=i.id
+             WHERE i.id=$1 GROUP BY i.id
+         )
+         SELECT COALESCE(SUM(CASE WHEN m.movement_type='outbound' THEN -m.quantity_delta ELSE 0 END),0)::numeric
+           FROM coverage c
+           CROSS JOIN LATERAL generate_series(GREATEST(c.starts,current_date-180),current_date-1,interval '1 day') calendar(day)
+           LEFT JOIN inventory_movements m ON m.inventory_item_id=$1 AND m.created_at>=calendar.day AND m.created_at<calendar.day+interval '1 day'
+          GROUP BY calendar.day ORDER BY calendar.day",
+    ).bind(item_id).fetch_all(&mut **transaction).await?;
+    Ok(rows)
+}
+
+fn calculate_safety_stock(
+    daily_outbound: &[Decimal],
+    lead_time_days: i32,
+    service_level: Decimal,
+) -> Option<Decimal> {
+    if daily_outbound.len() < 28 || !(1..=60).contains(&lead_time_days) {
+        return None;
+    }
+    let z_score = if service_level == Decimal::new(90, 2) {
+        1.281_552
+    } else if service_level == Decimal::new(95, 2) {
+        1.644_854
+    } else if service_level == Decimal::new(975, 3) {
+        1.959_964
+    } else if service_level == Decimal::new(99, 2) {
+        2.326_348
+    } else {
+        return None;
+    };
+    let observations = daily_outbound
+        .iter()
+        .rev()
+        .take(180)
+        .map(|value| value.to_f64())
+        .collect::<Option<Vec<_>>>()?;
+    let mean = observations.iter().sum::<f64>() / observations.len() as f64;
+    let variance = observations
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (observations.len() - 1) as f64;
+    let recommended = z_score * variance.sqrt() * (lead_time_days as f64).sqrt();
+    Decimal::from_f64_retain(recommended.max(0.0)).map(|value| {
+        value.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToPositiveInfinity)
+    })
+}
+
+fn safety_stock_data_is_eligible(completed_days: usize, recent_outbound_days: usize) -> bool {
+    completed_days >= 35 && recent_outbound_days >= 5
+}
+
+fn replay_movement_balances(
+    opening_balance: Decimal,
+    deltas: &[Decimal],
+) -> Result<(Decimal, Vec<Decimal>), usize> {
+    let mut balance = opening_balance;
+    let mut balances = Vec::with_capacity(deltas.len());
+    for (index, delta) in deltas.iter().enumerate() {
+        balance += delta;
+        if balance < Decimal::ZERO {
+            return Err(index);
+        }
+        balances.push(balance);
+    }
+    Ok((balance, balances))
+}
+
+fn rebuild_movement_balances(
+    target_balance: Decimal,
+    deltas: &[Decimal],
+) -> Result<(Decimal, Vec<Decimal>), Option<usize>> {
+    let opening_balance = target_balance - deltas.iter().copied().sum::<Decimal>();
+    if opening_balance < Decimal::ZERO {
+        return Err(None);
+    }
+    replay_movement_balances(opening_balance, deltas)
+        .map(|(_, balances)| (opening_balance, balances))
+        .map_err(Some)
+}
+
+fn unit_multiplier(
+    entered: &str,
+    unit: &str,
+    package_unit: Option<&str>,
+    package_size: Decimal,
+    pallet_unit: Option<&str>,
+    pallet_size: Decimal,
+) -> Option<Decimal> {
+    if entered == unit {
+        Some(Decimal::ONE)
+    } else if package_unit == Some(entered) {
+        Some(package_size)
+    } else if pallet_unit == Some(entered) {
+        Some(pallet_size)
+    } else {
+        None
+    }
+}
+
+fn classify_stock(
+    current: Decimal,
+    safe: Decimal,
+    unit: &str,
+) -> (&'static str, &'static str, String, &'static str) {
+    let diff = current - safe;
+    if safe <= Decimal::ZERO {
+        (
+            "safe",
+            "안전재고 미설정",
+            "안전재고 기준 미설정".to_string(),
+            "안전재고를 설정하면 부족/과다 상태를 판정합니다",
+        )
+    } else if current < safe * Decimal::new(5, 1) {
+        (
+            "shortage",
+            "재고 부족",
+            format!("부족분: {}{unit}", diff.round_dp(2).normalize()),
+            "재고 하한선 이탈 -> 즉시 추가 발주 필요",
+        )
+    } else if current > safe * Decimal::from(2u32) {
+        (
+            "overstock",
+            "재고 과다",
+            format!("초과분: +{}{unit}", diff.round_dp(2).normalize()),
+            "창고 점유율 초과 -> 출하량 증대 필요",
+        )
+    } else {
+        (
+            "safe",
+            "안전 재고",
+            "적정 범위 유지".to_string(),
+            "수요 안정적 -> 현 유통 계획 유지",
+        )
+    }
+}
+
+fn next_delivery_state(current: &str) -> Result<(&'static str, &'static str, bool), ()> {
+    match current {
+        "AT_PICKUP" => Ok(("IN_TRANSIT", "허브터미널 이동중", false)),
+        "IN_TRANSIT" => Ok(("OUT_FOR_DELIVERY", "배달출발", false)),
+        "OUT_FOR_DELIVERY" => Ok(("DELIVERED", "배송완료", true)),
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_approved_movement_changes, calculate_safety_stock, calculate_zone_occupancy,
+        classify_stock, delivery_warehouse_scope, evaluate_demand_forest, list_inventory_forecast,
+        list_inventory_ledger, load_safety_stock_history, next_delivery_state, AnalysisResult,
+        VisualFeatures,
+        rebuild_movement_balances, replay_movement_balances, safety_stock_data_is_eligible,
+        submit_movement_import, AppState, ApprovedMovementInsert, AuthenticatedUser, ForecastQuery,
+        HistoricalMovementImport, HistoricalMovementRow, MovementQuery, StatusCode,
+    };
+    use chrono::Datelike;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn vision_result_serializes_structured_visual_features() {
+        let result = AnalysisResult {
+            item_name: "상자".into(),
+            estimated_quantity: Decimal::ONE,
+            unit: "ea".into(),
+            status: "safe".into(),
+            status_label: "안전 재고".into(),
+            confidence: 80,
+            recommendation: "확인".into(),
+            reason: "전면 상자 1개".into(),
+            visual_features: VisualFeatures {
+                objects: vec!["상자".into()],
+                colors: vec!["갈색".into()],
+                shapes_and_edges: vec!["직육면체 모서리".into()],
+                text: vec!["A-12".into()],
+                logos: vec!["WMS".into()],
+                description: "갈색 상자".into(),
+                quantity_basis: "분리된 상자 1개 확인".into(),
+            },
+        };
+
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["visualFeatures"]["shapesAndEdges"][0], "직육면체 모서리");
+        assert_eq!(json["visualFeatures"]["quantityBasis"], "분리된 상자 1개 확인");
+    }
+
+    #[test]
+    fn stock_status_respects_shortage_and_overstock_boundaries() {
+        assert_eq!(
+            classify_stock(Decimal::from(49), Decimal::from(100), "톤").0,
+            "shortage"
+        );
+        assert_eq!(
+            classify_stock(Decimal::from(50), Decimal::from(100), "톤").0,
+            "safe"
+        );
+        assert_eq!(
+            classify_stock(Decimal::from(200), Decimal::from(100), "톤").0,
+            "safe"
+        );
+        assert_eq!(
+            classify_stock(Decimal::from(201), Decimal::from(100), "톤").0,
+            "overstock"
+        );
+    }
+
+    #[test]
+    fn delivery_progression_stops_after_delivered() {
+        assert_eq!(next_delivery_state("AT_PICKUP").unwrap().0, "IN_TRANSIT");
+        assert_eq!(
+            next_delivery_state("IN_TRANSIT").unwrap().0,
+            "OUT_FOR_DELIVERY"
+        );
+        assert_eq!(
+            next_delivery_state("OUT_FOR_DELIVERY").unwrap().0,
+            "DELIVERED"
+        );
+        assert!(next_delivery_state("DELIVERED").is_err());
+    }
+
+    #[test]
+    fn delivery_scope_never_treats_unassigned_users_as_global() {
+        let manager_without_warehouse = AuthenticatedUser {
+            id: "manager-1".to_string(),
+            email: "manager@example.test".to_string(),
+            role: "관리자".to_string(),
+            status: "APPROVED".to_string(),
+            warehouse_id: None,
+        };
+        assert!(delivery_warehouse_scope(&manager_without_warehouse).is_err());
+
+        let worker = AuthenticatedUser {
+            warehouse_id: Some("wh_alpha".to_string()),
+            ..manager_without_warehouse.clone()
+        };
+        assert_eq!(
+            delivery_warehouse_scope(&worker).unwrap().as_deref(),
+            Some("wh_alpha")
+        );
+
+        let server_admin = AuthenticatedUser {
+            role: "서버 관리자".to_string(),
+            warehouse_id: Some("wh_alpha".to_string()),
+            ..manager_without_warehouse
+        };
+        assert_eq!(delivery_warehouse_scope(&server_admin).unwrap(), None);
+    }
+
+    #[test]
+    fn zone_occupancy_handles_empty_capacity_and_overflow() {
+        assert_eq!(
+            calculate_zone_occupancy(Decimal::ZERO, Decimal::from(100)),
+            (1.0, "empty", "비어 있음")
+        );
+        let (empty_ratio, state, _) =
+            calculate_zone_occupancy(Decimal::from(25), Decimal::from(100));
+        assert!((empty_ratio - 0.75).abs() < f64::EPSILON);
+        assert_eq!(state, "normal");
+        assert_eq!(
+            calculate_zone_occupancy(Decimal::from(120), Decimal::from(100)),
+            (0.0, "warning", "용량 초과")
+        );
+        assert_eq!(
+            calculate_zone_occupancy(Decimal::from(3), Decimal::ZERO),
+            (0.0, "warning", "용량 초과")
+        );
+    }
+
+    #[test]
+    fn random_forest_trains_forecasts_and_reports_time_holdout_error() {
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let histories = (0..5)
+            .map(|item| {
+                (0..420)
+                    .map(|day| {
+                        let date = start + chrono::Duration::days(day);
+                        let weekday_factor = if date.weekday().number_from_monday() >= 6 { 1.8 } else { 1.0 };
+                        let month_factor = 1.0 + ((date.month() as f64 / 12.0) * std::f64::consts::TAU).sin() * 0.25;
+                        let value = 10.0 + item as f64 * 2.0 + (day as f64 / 180.0) + weekday_factor * month_factor;
+                        (date, Decimal::from_f64_retain(value).unwrap())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for horizon in [1, 7, 30] {
+            let result = evaluate_demand_forest(&histories, horizon);
+            assert!(result.sample_count > 0);
+            assert!(result.wape.is_some_and(|value| value >= Decimal::ZERO));
+            assert!(result.baseline_wape.is_some_and(|value| value >= Decimal::ZERO));
+            assert!(result.predictions.iter().all(|value| value.is_some_and(|quantity| quantity >= Decimal::ZERO)));
+            assert_eq!(result.baseline_predictions.len(), histories.len());
+        }
+    }
+
+    #[test]
+    fn random_forest_requires_enough_history_and_keeps_zero_demand_in_wape() {
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let sparse = (0..3)
+            .map(|_| (0..120).map(|day| (start + chrono::Duration::days(day), Decimal::ZERO)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let short = evaluate_demand_forest(&sparse, 7);
+        assert!(short.sample_count > 0);
+        assert!(short.wape.is_none());
+        assert!(short.predictions.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn safety_stock_requires_28_days_and_uses_service_level_z_score() {
+        let steady = vec![Decimal::from(10); 28];
+        assert_eq!(
+            calculate_safety_stock(&steady, 7, Decimal::new(95, 2)),
+            Some(Decimal::ZERO)
+        );
+        assert!(calculate_safety_stock(&steady[..27], 7, Decimal::new(95, 2)).is_none());
+        assert!(calculate_safety_stock(&steady, 7, Decimal::new(92, 2)).is_none());
+
+        let variable = (0..28)
+            .map(|day| Decimal::from(if day % 2 == 0 { 5 } else { 15 }))
+            .collect::<Vec<_>>();
+        let recommendation = calculate_safety_stock(&variable, 7, Decimal::new(95, 2)).unwrap();
+        assert!(recommendation > Decimal::ZERO);
+        assert!(calculate_safety_stock(&variable, 0, Decimal::new(95, 2)).is_none());
+    }
+
+    #[test]
+    fn safety_stock_eligibility_requires_history_and_recent_outbound_days() {
+        assert!(!safety_stock_data_is_eligible(34, 28));
+        assert!(!safety_stock_data_is_eligible(35, 4));
+        assert!(safety_stock_data_is_eligible(35, 5));
+        assert!(safety_stock_data_is_eligible(90, 28));
+    }
+
+    #[test]
+    fn safety_stock_uses_up_to_180_complete_days() {
+        let mut history = vec![Decimal::ZERO; 181];
+        history[0] = Decimal::from(100);
+        assert_eq!(
+            calculate_safety_stock(&history, 7, Decimal::new(95, 2)),
+            Some(Decimal::ZERO)
+        );
+        history[100] = Decimal::from(100);
+        assert!(calculate_safety_stock(&history, 7, Decimal::new(95, 2)).unwrap() > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WMS_TEST_DATABASE_URL"]
+    async fn safety_stock_history_includes_sparse_outbound_days() {
+        let database_url = std::env::var("WMS_TEST_DATABASE_URL").expect("WMS_TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_items (id UUID PRIMARY KEY, warehouse_id TEXT NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL, safe NUMERIC NOT NULL, safety_stock_mode TEXT NOT NULL, safety_stock_prompted BOOLEAN NOT NULL, safety_stock_lead_time_days INTEGER NOT NULL, safety_stock_service_level NUMERIC NOT NULL, archived_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL)")
+            .execute(&mut *transaction).await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movements (inventory_item_id UUID NOT NULL, created_at TIMESTAMPTZ NOT NULL, movement_type TEXT NOT NULL, quantity_delta NUMERIC NOT NULL)")
+            .execute(&mut *transaction).await.unwrap();
+        let item_ids = (0..6).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        for (index, item_id) in item_ids.iter().enumerate() {
+            sqlx::query("INSERT INTO inventory_items VALUES ($1, 'test', $2, 'ea', 0, 'manual', false, 7, 0.95, NULL, current_date - interval '500 days')")
+                .bind(item_id)
+                .bind(format!("test item {index}"))
+                .execute(&mut *transaction).await.unwrap();
+            sqlx::query("INSERT INTO inventory_movements SELECT $1, current_date - (days * interval '1 day'), 'outbound', -10 FROM unnest(ARRAY[10,15,20,45,120,181,250,350,450]) AS days")
+                .bind(item_id).execute(&mut *transaction).await.unwrap();
+        }
+        let item_id = item_ids[0];
+        let history = load_safety_stock_history(&mut transaction, item_id)
+            .await
+            .unwrap();
+        let active_days = history
+            .iter()
+            .filter(|value| **value > Decimal::ZERO)
+            .count();
+        let recent_days = history
+            .iter()
+            .rev()
+            .take(28)
+            .filter(|value| **value > Decimal::ZERO)
+            .count();
+        assert_eq!((history.len(), active_days, recent_days), (180, 5, 3));
+        assert!(safety_stock_data_is_eligible(history.len(), active_days));
+        assert!(calculate_safety_stock(&history, 7, Decimal::new(95, 2)).unwrap() > Decimal::ZERO);
+        transaction.commit().await.unwrap();
+        let result = list_inventory_forecast(
+            axum::extract::State(AppState {
+                db: Some(pool.clone()),
+                jwt_secret: String::new(),
+            }),
+            axum::extract::Query(ForecastQuery {
+                warehouse_id: Some("test".into()),
+                history_days: Some(1095),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let item = result["items"].as_array().unwrap().iter().find(|item| item["itemId"] == item_id.to_string()).unwrap();
+        assert_eq!(item["historyDays"], 450);
+        assert_eq!(item["safetyStockHistoryDays"], 180);
+        assert_eq!(item["outboundDays"], 5);
+        assert_eq!(item["safetyStockEligible"], true);
+        assert!(item["forecastOutflow7d"].as_str().unwrap().parse::<f64>().unwrap() >= 0.0);
+        let horizons = result["horizonBacktests"].as_array().unwrap();
+        assert_eq!(horizons.len(), 3);
+        for (index, expected_days) in [1, 7, 30].iter().enumerate() {
+            assert_eq!(horizons[index]["horizonDays"], *expected_days);
+            assert!(horizons[index]["sampleCount"].as_u64().unwrap() > 0);
+            assert!(!horizons[index]["wapePct"].is_null());
+            assert!(!horizons[index]["baselineWapePct"].is_null());
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WMS_TEST_DATABASE_URL"]
+    async fn ledger_pages_filter_by_item_id_and_keep_equal_timestamps() {
+        let database_url = std::env::var("WMS_TEST_DATABASE_URL").expect("WMS_TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&database_url).await.unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_items (id UUID PRIMARY KEY, warehouse_id TEXT NOT NULL, unit TEXT NOT NULL)")
+            .execute(&mut *transaction).await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movements (id UUID PRIMARY KEY, inventory_item_id UUID NOT NULL, warehouse_id TEXT NOT NULL, item_name TEXT NOT NULL, movement_type TEXT NOT NULL, quantity_delta NUMERIC NOT NULL, balance_after NUMERIC NOT NULL, note TEXT NOT NULL, source TEXT NOT NULL, actor_email TEXT, created_at TIMESTAMPTZ NOT NULL)")
+            .execute(&mut *transaction).await.unwrap();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO inventory_items VALUES ($1,'test','ea'),($2,'test','box')")
+            .bind(first).bind(second).execute(&mut *transaction).await.unwrap();
+        for item in [first, first, first, second] {
+            sqlx::query("INSERT INTO inventory_movements VALUES ($1,$2,'test','비슷한 품목','outbound',-1,10,'QA','test',NULL,'2026-01-01T00:00:00Z')")
+                .bind(uuid::Uuid::new_v4()).bind(item).execute(&mut *transaction).await.unwrap();
+        }
+        transaction.commit().await.unwrap();
+        let state = AppState { db: Some(pool.clone()), jwt_secret: String::new() };
+        let query = |before, before_id| MovementQuery {
+            warehouse_id: Some("test".into()), days: None, operator: None, source: None,
+            movement_type: None, item: None, limit: Some(2), item_id: Some(first), before, before_id,
+        };
+        let first_page = list_inventory_ledger(axum::extract::State(state.clone()), axum::extract::Query(query(None, None))).await.unwrap().0;
+        assert_eq!(first_page.len(), 2);
+        assert!(first_page.iter().all(|row| row["inventoryItemId"] == first.to_string() && row["unit"] == "ea"));
+        let before = first_page[1]["occurredAt"].as_str().unwrap().parse().unwrap();
+        let before_id = first_page[1]["id"].as_str().unwrap().parse().unwrap();
+        let second_page = list_inventory_ledger(axum::extract::State(state), axum::extract::Query(query(Some(before), Some(before_id)))).await.unwrap().0;
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0]["id"], second_page[0]["id"]);
+        assert_ne!(first_page[1]["id"], second_page[0]["id"]);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WMS_TEST_DATABASE_URL"]
+    async fn batched_movement_import_detects_duplicates_and_stores_rows() {
+        let database_url = std::env::var("WMS_TEST_DATABASE_URL").expect("WMS_TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_items (id UUID PRIMARY KEY, warehouse_id TEXT NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL, package_unit TEXT, package_size NUMERIC NOT NULL, pallet_unit TEXT, pallet_size NUMERIC NOT NULL, archived_at TIMESTAMPTZ, pending_batch_id UUID, created_at TIMESTAMPTZ NOT NULL)")
+            .execute(&mut *connection).await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movements (warehouse_id TEXT NOT NULL, inventory_item_id UUID NOT NULL, movement_type TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, quantity_delta NUMERIC NOT NULL)")
+            .execute(&mut *connection).await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movement_import_batches (id UUID PRIMARY KEY, warehouse_id TEXT NOT NULL, submitted_by TEXT NOT NULL, submitted_email TEXT NOT NULL, source_name TEXT NOT NULL, row_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING')")
+            .execute(&mut *connection).await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movement_import_rows (batch_id UUID NOT NULL, inventory_item_id UUID NOT NULL, item_name TEXT NOT NULL, occurred_at TIMESTAMPTZ NOT NULL, movement_type TEXT NOT NULL, quantity_delta NUMERIC NOT NULL, note TEXT NOT NULL, reference TEXT NOT NULL)")
+            .execute(&mut *connection).await.unwrap();
+
+        let item_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO inventory_items VALUES ($1,'test','item','ea',NULL,1,NULL,1,NULL,NULL,now())")
+            .bind(item_id).execute(&mut *connection).await.unwrap();
+        let occurred_at = chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        sqlx::query("INSERT INTO inventory_movements VALUES ('test',$1,'outbound',$2,-1),('test',$1,'initial','2025-01-02T00:00:00Z',10)")
+            .bind(item_id).bind(occurred_at).execute(&mut *connection).await.unwrap();
+        drop(connection);
+
+        let make_input = |allow_duplicates, row_count: usize, start_offset: i64| HistoricalMovementImport {
+            warehouse_id: "test".into(),
+            source_name: "test-50k.xlsx".into(),
+            new_items: Vec::new(),
+            allow_duplicates,
+            rows: (0..row_count)
+                .map(|index| HistoricalMovementRow {
+                    source_row: Some(index + 2),
+                    inventory_item_id: Some(item_id),
+                    item_name: None,
+                    occurred_at: occurred_at
+                        + chrono::Duration::seconds(start_offset + index as i64),
+                    movement_type: "outbound".into(),
+                    quantity: Decimal::ONE,
+                    quantity_unit: Some("ea".into()),
+                    note: "test import".into(),
+                    reference: None,
+                })
+                .collect(),
+        };
+        let user = || AuthenticatedUser {
+            id: "test-user".into(),
+            email: "test@example.test".into(),
+            role: "관리자".into(),
+            status: "APPROVED".into(),
+            warehouse_id: Some("test".into()),
+        };
+        let state = || AppState { db: Some(pool.clone()), jwt_secret: String::new() };
+
+        let duplicate_result = submit_movement_import(
+            axum::extract::State(state()),
+            axum::Extension(user()),
+            axum::Json(make_input(false, 1, 0)),
+        )
+        .await;
+        assert!(matches!(duplicate_result, Err((StatusCode::CONFLICT, _))));
+
+        let accepted = submit_movement_import(
+            axum::extract::State(state()),
+            axum::Extension(user()),
+            axum::Json(make_input(true, 1, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.0, StatusCode::ACCEPTED);
+        let bulk_accepted = submit_movement_import(
+            axum::extract::State(state()),
+            axum::Extension(user()),
+            axum::Json(make_input(false, 50000, 100000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bulk_accepted.0, StatusCode::ACCEPTED);
+        let imported_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_movement_import_rows")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(imported_rows, 50001);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WMS_TEST_DATABASE_URL"]
+    async fn approved_movement_changes_store_and_recalculate_large_batches() {
+        let database_url = std::env::var("WMS_TEST_DATABASE_URL").expect("WMS_TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE inventory_movements (id UUID PRIMARY KEY, warehouse_id TEXT, inventory_item_id UUID, item_name TEXT, movement_type TEXT, quantity_delta NUMERIC, balance_after NUMERIC, note TEXT, source TEXT, actor_id TEXT, actor_email TEXT, created_at TIMESTAMPTZ)")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let existing_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO inventory_movements (id,balance_after) SELECT gen_random_uuid(),0 FROM generate_series(1,5261) RETURNING id",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .unwrap();
+        let occurred_at = chrono::Utc::now();
+        let inserts = (0..5261)
+            .map(|index| ApprovedMovementInsert {
+                warehouse_id: "test".into(),
+                item_id: uuid::Uuid::nil(),
+                item_name: format!("item-{index}"),
+                movement_type: "inbound".into(),
+                quantity_delta: Decimal::ONE,
+                balance_after: Decimal::ONE,
+                note: String::new(),
+                source: "historical_import:test".into(),
+                actor_id: "test-user".into(),
+                actor_email: "test@example.test".into(),
+                occurred_at,
+            })
+            .collect::<Vec<_>>();
+        let updates = existing_ids
+            .into_iter()
+            .map(|id| (id, Decimal::ONE))
+            .collect::<Vec<_>>();
+
+        apply_approved_movement_changes(&mut transaction, &inserts, &updates)
+            .await
+            .unwrap();
+
+        let inserted_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inventory_movements WHERE source='historical_import:test'",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+        let recalculated_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inventory_movements WHERE balance_after=1",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(inserted_count, 5261);
+        assert_eq!(recalculated_count, 10522);
+        transaction.rollback().await.unwrap();
+        pool.close().await;
+    }
+
+    #[test]
+    fn archived_item_history_replays_before_zeroing_archive_balance() {
+        let historical = [Decimal::from(20), Decimal::from(-5)];
+        let (remaining, balances) =
+            replay_movement_balances(Decimal::from(100), &historical).unwrap();
+        assert_eq!(balances, vec![Decimal::from(120), Decimal::from(115)]);
+        assert_eq!(remaining + (-remaining), Decimal::ZERO);
+
+        let prior_to_initial = [Decimal::from(-10), Decimal::from(20)];
+        let (opening, prior_balances) =
+            rebuild_movement_balances(Decimal::from(100), &prior_to_initial).unwrap();
+        assert_eq!(opening, Decimal::from(90));
+        assert_eq!(prior_balances, vec![Decimal::from(80), Decimal::from(100)]);
+    }
+
+    #[test]
+    fn archived_item_history_rejects_negative_intermediate_balance() {
+        assert_eq!(
+            replay_movement_balances(
+                Decimal::from(100),
+                &[Decimal::from(-120), Decimal::from(20)]
+            ),
+            Err(0)
+        );
+        assert_eq!(
+            rebuild_movement_balances(Decimal::from(5), &[Decimal::from(10)]),
+            Err(None)
+        );
+    }
+}
+
+fn database_not_configured() -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DATABASE_URL is not configured".to_string(),
+    )
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!(%error, "database request failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "database request failed".to_string(),
+    )
+}
+
+async fn users_action(
+    State(state): State<AppState>,
+    auth: Option<axum::Extension<AuthenticatedUser>>,
+    Json(input): Json<UserAction>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.clone().ok_or_else(database_not_configured)?;
+    match input.action.as_str() {
+        "signup" => {
+            let email = required(input.email, "email")?;
+            let password = required(input.password, "password")?;
+            let name = required(input.name, "name")?;
+            let role = input.role.unwrap_or_else(|| "창고지기".to_string());
+            if role != "관리자" && role != "창고지기" {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "가입할 수 없는 역할입니다.".to_string(),
+                ));
+            }
+            let username = input
+                .username
+                .clone()
+                .unwrap_or_else(|| email.split('@').next().unwrap_or("user").to_string());
+            if username.eq_ignore_ascii_case("yewon")
+                || email.eq_ignore_ascii_case("yewon@wms-smartstock.ai")
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "이미 사용 중인 아이디 또는 이메일입니다.".to_string(),
+                ));
+            }
+            let admin_email = if role == "관리자" {
+                None
+            } else {
+                let requested_admin = required(input.admin_email, "adminEmail")?
+                    .trim()
+                    .to_lowercase();
+                let approved_manager = sqlx::query_scalar::<_, String>(
+                    "SELECT email FROM users WHERE lower(email)=$1 AND role='관리자' AND status='APPROVED' AND warehouse_id IS NOT NULL",
+                ).bind(&requested_admin).fetch_optional(&db).await.map_err(internal_error)?;
+                Some(approved_manager.ok_or_else(|| (
+                    StatusCode::CONFLICT,
+                    "승인 완료된 창고 관리자 계정이 아닙니다. 서버 관리자가 승인한 관리자 이메일을 입력하세요.".to_string(),
+                ))?)
+            };
+            let existing = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM users WHERE email = $1 OR username = $2",
+            )
+            .bind(&email)
+            .bind(&username)
+            .fetch_one(&db)
+            .await
+            .map_err(internal_error)?;
+            if existing > 0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "이미 존재하는 이메일입니다.".to_string(),
+                ));
+            }
+            let salt = SaltString::generate(&mut rand::thread_rng());
+            let password_hash = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "비밀번호 해시 생성 실패".to_string(),
+                    )
+                })?
+                .to_string();
+            let status = if role == "관리자" {
+                "PENDING_ADMIN"
+            } else {
+                "PENDING_WAREHOUSE"
+            };
+            let user = sqlx::query_as::<_, UserRecord>(
+                "INSERT INTO users (username, email, password_hash, name, role, status, admin_email)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 RETURNING id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at",
+            ).bind(&username).bind(&email).bind(password_hash).bind(name).bind(role).bind(status).bind(admin_email)
+            .fetch_one(&db).await.map_err(internal_error)?;
+            if user.role == "창고지기" {
+                sqlx::query("INSERT INTO warehouse_access_requests (user_email, user_name, admin_email) VALUES ($1, $2, $3)")
+                    .bind(&user.email).bind(&user.name).bind(&user.admin_email)
+                    .execute(&db).await.map_err(internal_error)?;
+            }
+            Ok(Json(serde_json::json!({ "success": true, "user": user })))
+        }
+        "login" => {
+            let login = input
+                .username
+                .or(input.email)
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, "email이 필요합니다.".to_string()))?;
+            let password = required(input.password, "password")?;
+
+            if login.eq_ignore_ascii_case("yewon")
+                || login.eq_ignore_ascii_case("yewon@wms-smartstock.ai")
+            {
+                let expected_password = env::var("SUPER_ADMIN_PASSWORD").map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SUPER_ADMIN_PASSWORD is not configured".to_string(),
+                    )
+                })?;
+                if password != expected_password {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "비밀번호가 일치하지 않습니다.".to_string(),
+                    ));
+                }
+                let token = create_session_token(
+                    &state,
+                    "usr_yewon",
+                    "yewon@wms-smartstock.ai",
+                    "서버 관리자",
+                    "APPROVED",
+                    Some("wh_wjmals".to_string()),
+                )?;
+                return Ok(Json(serde_json::json!({
+                    "success": true,
+                    "token": token,
+                    "user": {
+                        "id": "usr_yewon",
+                        "username": "Yewon",
+                        "email": "yewon@wms-smartstock.ai",
+                        "name": "Yewon (총괄/서버 관리자)",
+                        "role": "서버 관리자",
+                        "status": "APPROVED",
+                        "warehouseId": "wh_wjmals",
+                        "adminEmail": null,
+                        "requestedAdminEmail": null,
+                        "createdAt": "2026-09-20T00:00:00Z",
+                        "approvedAt": "2026-09-20T00:00:00Z"
+                    }
+                })));
+            }
+
+            // SELECT: id, username(nullable), email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at, password_hash
+            let row = sqlx::query_as::<_, (Uuid, Option<String>, String, String, String, String, Option<String>, Option<String>, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>, String)>(
+                "SELECT id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at, password_hash FROM users WHERE email = $1 OR username = $1",
+            ).bind(&login).fetch_optional(&db).await.map_err(internal_error)?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "등록되지 않은 계정입니다.".to_string()))?;
+            let verified = PasswordHash::new(&row.11)
+                .ok()
+                .map(|parsed| {
+                    Argon2::default()
+                        .verify_password(password.as_bytes(), &parsed)
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            if !verified {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "비밀번호가 일치하지 않습니다.".to_string(),
+                ));
+            }
+            let token = create_session_token(
+                &state,
+                &row.0.to_string(),
+                &row.2,
+                &row.4,
+                &row.5,
+                row.6.clone(),
+            )?;
+            let display_username = row
+                .1
+                .clone()
+                .unwrap_or_else(|| row.2.split('@').next().unwrap_or("user").to_string());
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "token": token,
+                "user": {
+                    "id": row.0,
+                    "username": display_username,
+                    "email": row.2,
+                    "name": row.3,
+                    "role": row.4,
+                    "status": row.5,
+                    "warehouseId": row.6,
+                    "adminEmail": row.7,
+                    "requestedAdminEmail": row.8,
+                    "createdAt": row.9,
+                    "approvedAt": row.10
+                }
+            })))
+        }
+        "request_access" => {
+            let user = auth
+                .as_ref()
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "로그인이 필요합니다.".to_string()))?;
+            let email = required(input.email, "email")?;
+            let admin_email = required(input.admin_email, "adminEmail")?;
+            if user.0.email != email || user.0.role != "창고지기" {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "본인 창고 접근 요청만 제출할 수 있습니다.".to_string(),
+                ));
+            }
+            sqlx::query("UPDATE users SET requested_admin_email = $1 WHERE email = $2")
+                .bind(&admin_email)
+                .bind(&email)
+                .execute(&db)
+                .await
+                .map_err(internal_error)?;
+            sqlx::query("DELETE FROM warehouse_access_requests WHERE user_email = $1 AND status = 'PENDING'")
+                .bind(&email).execute(&db).await.map_err(internal_error)?;
+            sqlx::query("INSERT INTO warehouse_access_requests (user_email, user_name, admin_email) SELECT email, name, $1 FROM users WHERE email = $2")
+                .bind(&admin_email).bind(&email).execute(&db).await.map_err(internal_error)?;
+            Ok(Json(
+                serde_json::json!({ "success": true, "message": format!("'{}' 관리자에게 권한 요청을 보냈습니다.", admin_email) }),
+            ))
+        }
+        "approve_user" => {
+            let user = auth
+                .as_ref()
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "로그인이 필요합니다.".to_string()))?;
+            if user.0.role != "관리자" && user.0.role != "서버 관리자" {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "관리자만 창고지기를 승인할 수 있습니다.".to_string(),
+                ));
+            }
+            let target = required(input.target_email, "targetEmail")?;
+            let admin = if user.0.role == "서버 관리자" {
+                required(input.admin_email, "adminEmail")?
+            } else {
+                user.0.email.clone()
+            };
+            // 관리자의 실제 warehouse_id 조회
+            let warehouse_id = if user.0.role == "서버 관리자" {
+                let wid = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT warehouse_id FROM users WHERE email = $1",
+                )
+                .bind(&admin)
+                .fetch_optional(&db)
+                .await
+                .map_err(internal_error)?;
+                wid.flatten()
+                    .unwrap_or_else(|| format!("wh_{}", admin.split('@').next().unwrap_or("wms")))
+            } else {
+                user.0.warehouse_id.clone().ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "관리자 창고가 배정되지 않았습니다.".to_string(),
+                    )
+                })?
+            };
+            // 창고가 없으면 생성
+            sqlx::query(
+                "INSERT INTO warehouses (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&warehouse_id)
+            .bind(&format!("{} 창고", warehouse_id.trim_start_matches("wh_")))
+            .execute(&db)
+            .await
+            .map_err(internal_error)?;
+            let updated = sqlx::query("UPDATE users SET status = 'APPROVED', admin_email = $1, warehouse_id = $2, approved_at = now(), requested_admin_email = NULL WHERE email = $3 AND role = '창고지기' AND status = 'PENDING_WAREHOUSE' AND ($1 = 'yewon@wms-smartstock.ai' OR admin_email = $1)")
+                .bind(&admin).bind(&warehouse_id).bind(&target).execute(&db).await.map_err(internal_error)?;
+            if updated.rows_affected() == 0 {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "승인 대기 중인 담당 창고지기를 찾을 수 없습니다.".to_string(),
+                ));
+            }
+            sqlx::query("UPDATE warehouse_access_requests SET status = 'APPROVED' WHERE user_email = $1 AND status = 'PENDING'")
+                .bind(&target).execute(&db).await.map_err(internal_error)?;
+            Ok(Json(
+                serde_json::json!({ "success": true, "targetEmail": target, "warehouseId": warehouse_id }),
+            ))
+        }
+        "approve_admin" => {
+            let user = auth
+                .as_ref()
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "로그인이 필요합니다.".to_string()))?;
+            if user.0.role != "서버 관리자" {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "서버 관리자만 관리자를 승인할 수 있습니다.".to_string(),
+                ));
+            }
+            // 서버 관리자가 창고 관리자 신청을 승인
+            let target = required(input.target_email, "targetEmail")?;
+            let name_part = target.split('@').next().unwrap_or("wms");
+            let warehouse_id = format!("wh_{}", name_part);
+            let warehouse_name = format!("{} 창고", name_part);
+            // 창고가 없으면 먼저 생성
+            sqlx::query(
+                "INSERT INTO warehouses (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&warehouse_id)
+            .bind(&warehouse_name)
+            .execute(&db)
+            .await
+            .map_err(internal_error)?;
+            let rows = sqlx::query(
+                "UPDATE users SET role = '관리자', status = 'APPROVED', warehouse_id = $1, approved_at = now() WHERE email = $2"
+            ).bind(&warehouse_id).bind(&target).execute(&db).await.map_err(internal_error)?;
+            if rows.rows_affected() == 0 {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "사용자를 찾을 수 없습니다.".to_string(),
+                ));
+            }
+            Ok(Json(
+                serde_json::json!({ "success": true, "targetEmail": target, "warehouseId": warehouse_id }),
+            ))
+        }
+        "invite_user" => {
+            let user = auth
+                .as_ref()
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "로그인이 필요합니다.".to_string()))?;
+            if user.0.role != "관리자" && user.0.role != "서버 관리자" {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "관리자만 창고지기를 초대할 수 있습니다.".to_string(),
+                ));
+            }
+            // Approve a previously registered keeper for this manager's warehouse.
+            let target = required(input.target_email, "targetEmail")?;
+            let admin = if user.0.role == "서버 관리자" {
+                required(input.admin_email, "adminEmail")?
+            } else {
+                user.0.email.clone()
+            };
+            if target.eq_ignore_ascii_case("yewon")
+                || target.eq_ignore_ascii_case("yewon@wms-smartstock.ai")
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "서버 관리자 계정은 초대할 수 없습니다.".to_string(),
+                ));
+            }
+            let warehouse_id = {
+                let row = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT warehouse_id FROM users WHERE email = $1",
+                )
+                .bind(&admin)
+                .fetch_optional(&db)
+                .await
+                .map_err(internal_error)?;
+                row.flatten()
+                    .unwrap_or_else(|| format!("wh_{}", admin.split('@').next().unwrap_or("wms")))
+            };
+            // 이미 존재하면 업데이트, 없으면 새로 생성
+            let exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = $1")
+                    .bind(&target)
+                    .fetch_one(&db)
+                    .await
+                    .map_err(internal_error)?;
+            if exists > 0 {
+                let result = sqlx::query("UPDATE users SET status = 'APPROVED', admin_email = $1, warehouse_id = $2, approved_at = now() WHERE email = $3 AND role = '창고지기' AND status = 'PENDING_WAREHOUSE' AND admin_email = $1")
+                    .bind(&admin).bind(&warehouse_id).bind(&target).execute(&db).await.map_err(internal_error)?;
+                if result.rows_affected() == 0 {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "창고지기 계정만 이 창고에 초대할 수 있습니다.".to_string(),
+                    ));
+                }
+            } else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "먼저 창고지기로 가입한 계정만 초대할 수 있습니다.".to_string(),
+                ));
+            }
+            Ok(Json(
+                serde_json::json!({ "success": true, "message": format!("'{}' 창고지기가 이 창고로 승인 등록되었습니다.", target) }),
+            ))
+        }
+        "delete_user" => {
+            let user = auth
+                .as_ref()
+                .ok_or_else(|| (StatusCode::UNAUTHORIZED, "로그인이 필요합니다.".to_string()))?;
+            let target = required(input.target_email, "targetEmail")?;
+            if target.eq_ignore_ascii_case("yewon")
+                || target.eq_ignore_ascii_case("yewon@wms-smartstock.ai")
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "총괄 서버 관리자 계정은 삭제할 수 없습니다.".to_string(),
+                ));
+            }
+            let result = if user.0.role == "서버 관리자" {
+                sqlx::query("DELETE FROM users WHERE email = $1")
+                    .bind(&target)
+                    .execute(&db)
+                    .await
+                    .map_err(internal_error)?
+            } else if user.0.role == "관리자" {
+                sqlx::query(
+                    "DELETE FROM users WHERE email = $1 AND admin_email = $2 AND role = '창고지기'",
+                )
+                .bind(&target)
+                .bind(&user.0.email)
+                .execute(&db)
+                .await
+                .map_err(internal_error)?
+            } else {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "관리자 권한이 필요합니다.".to_string(),
+                ));
+            };
+            if result.rows_affected() == 0 {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "사용자를 찾을 수 없습니다.".to_string(),
+                ));
+            }
+            Ok(Json(
+                serde_json::json!({ "success": true, "deletedEmail": target }),
+            ))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "유효하지 않은 요청입니다.".to_string(),
+        )),
+    }
+}
+
+async fn get_users(
+    State(state): State<AppState>,
+    Query(query): Query<UserQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let action = query.action.unwrap_or_else(|| "list".to_string());
+    if action == "get_user" {
+        let email = required(query.email, "email")?;
+        if user.role != "서버 관리자" && user.email != email && user.id != email {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "본인 계정 정보만 조회할 수 있습니다.".to_string(),
+            ));
+        }
+        if user.role == "서버 관리자" && (email.eq_ignore_ascii_case("yewon") || email == user.email) {
+            return Ok(Json(serde_json::json!({
+                "id": user.id,
+                "username": "Yewon",
+                "email": user.email,
+                "name": "Yewon (총괄/서버 관리자)",
+                "role": "서버 관리자",
+                "status": "APPROVED",
+                "warehouseId": user.warehouse_id,
+                "adminEmail": null,
+                "requestedAdminEmail": null,
+                "createdAt": "2026-09-20T00:00:00Z",
+                "approvedAt": "2026-09-20T00:00:00Z"
+            })));
+        }
+        let user = sqlx::query_as::<_, UserRecord>("SELECT id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at FROM users WHERE email = $1 OR username = $1")
+            .bind(email).fetch_optional(&db).await.map_err(internal_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "사용자를 찾을 수 없습니다.".to_string()))?;
+        return Ok(Json(serde_json::to_value(user).unwrap_or(Value::Null)));
+    }
+    if action == "list_requests" {
+        let admin = required(query.admin_email, "adminEmail")?;
+        if user.role != "서버 관리자" && (user.role != "관리자" || user.email != admin) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "본인 창고 요청만 조회할 수 있습니다.".to_string(),
+            ));
+        }
+        let requests = sqlx::query_as::<_, (Uuid, String, String, DateTime<Utc>)>(
+            "SELECT id, user_email, user_name, requested_at FROM warehouse_access_requests WHERE admin_email = $1 AND status = 'PENDING' ORDER BY requested_at",
+        ).bind(&admin).fetch_all(&db).await.map_err(internal_error)?;
+        let pending = requests.into_iter().map(|r| serde_json::json!({ "id": r.0, "userEmail": r.1, "userName": r.2, "requestedAt": r.3 })).collect::<Vec<_>>();
+        let members = sqlx::query_as::<_, UserRecord>("SELECT id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at FROM users WHERE admin_email = $1 AND status = 'APPROVED' ORDER BY name")
+            .bind(admin).fetch_all(&db).await.map_err(internal_error)?;
+        return Ok(Json(
+            serde_json::json!({ "pendingRequests": pending, "teamMembers": members }),
+        ));
+    }
+    if action == "list_admin_requests" {
+        if user.role != "서버 관리자" {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "서버 관리자 권한이 필요합니다.".to_string(),
+            ));
+        }
+        let users = sqlx::query_as::<_, UserRecord>("SELECT id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at FROM users WHERE (role = '관리자' AND status <> 'APPROVED') OR status = 'PENDING_ADMIN' ORDER BY created_at")
+            .fetch_all(&db).await.map_err(internal_error)?;
+        return Ok(Json(serde_json::to_value(users).unwrap_or(Value::Null)));
+    }
+    if user.role != "서버 관리자" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "사용자 전체 목록 조회 권한이 없습니다.".to_string(),
+        ));
+    }
+    let users = sqlx::query_as::<_, UserRecord>("SELECT id, username, email, name, role, status, warehouse_id, admin_email, requested_admin_email, created_at, approved_at FROM users ORDER BY created_at")
+        .fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(users).unwrap_or(Value::Null)))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Query(query): Query<UserQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if user.role != "서버 관리자" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "서버 관리자만 사용자를 삭제할 수 있습니다.".to_string(),
+        ));
+    }
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let email = required(query.email, "email")?;
+    let result = sqlx::query("DELETE FROM users WHERE email = $1")
+        .bind(&email)
+        .execute(&db)
+        .await
+        .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "사용자를 찾을 수 없습니다.".to_string(),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({ "success": true, "deletedEmail": email }),
+    ))
+}
+
+async fn list_zones(
+    State(state): State<AppState>,
+    Query(query): Query<ZoneQuery>,
+) -> Result<Json<Vec<ZoneRecord>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, Value, Decimal, String, DateTime<Utc>)>(
+        "SELECT id,warehouse_id,name,state,state_label,temp,items,capacity,capacity_unit,updated_at FROM warehouse_zones WHERE warehouse_id=$1 ORDER BY id",
+    ).bind(&warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    let inventory = sqlx::query_as::<_, (String, Decimal, String)>("SELECT name,current,unit FROM inventory_items WHERE warehouse_id=$1 AND archived_at IS NULL")
+        .bind(&warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    let zones = rows
+        .into_iter()
+        .map(|row| {
+            let assigned = row
+                .6
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .filter(|item| {
+                    inventory
+                        .iter()
+                        .any(|(name, _, _)| name.eq_ignore_ascii_case(item))
+                })
+                .collect::<Vec<_>>();
+            let current_stock_sum = inventory
+                .iter()
+                .filter(|(name, _, unit)| {
+                    *unit == row.8 && assigned.iter().any(|item| item.eq_ignore_ascii_case(name))
+                })
+                .map(|(_, current, _)| *current)
+                .sum::<Decimal>();
+            let capacity = row.7.max(Decimal::ZERO);
+            let (empty_ratio, state, state_label) =
+                calculate_zone_occupancy(current_stock_sum, capacity);
+            ZoneRecord {
+                id: row.0,
+                warehouse_id: row.1,
+                name: row.2,
+                state: state.to_string(),
+                state_label: state_label.to_string(),
+                temp: row.5,
+                items: Value::from(assigned),
+                capacity,
+                capacity_unit: row.8,
+                current_stock_sum,
+                empty_ratio,
+                updated_at: row.9,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(zones))
+}
+
+async fn save_zone(
+    State(state): State<AppState>,
+    Json(input): Json<SaveZone>,
+) -> Result<Json<ZoneRecord>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    if input.id.trim().is_empty() || input.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "id와 name은 필수입니다.".to_string(),
+        ));
+    }
+    let zone = sqlx::query_as::<_, ZoneRecord>(
+           "INSERT INTO warehouse_zones (id,warehouse_id,name,state,state_label,temp,items,capacity,capacity_unit)
+            VALUES ($1,$2,$3,COALESCE($4,'normal'),COALESCE($5,'정상'),COALESCE($6,'-20°C'),COALESCE($7,'[]'::jsonb),COALESCE($8,100000),COALESCE($9,'톤'))
+            ON CONFLICT (warehouse_id,id) DO UPDATE SET name=EXCLUDED.name,state=EXCLUDED.state,state_label=EXCLUDED.state_label,temp=EXCLUDED.temp,items=EXCLUDED.items,capacity=EXCLUDED.capacity,capacity_unit=EXCLUDED.capacity_unit,updated_at=now()
+            RETURNING id,warehouse_id,name,state,state_label,temp,items,capacity,capacity_unit,0::numeric AS current_stock_sum,1.0::float8 AS empty_ratio,updated_at",
+        ).bind(input.id).bind(input.warehouse_id).bind(input.name).bind(input.state).bind(input.state_label).bind(input.temp).bind(input.items).bind(input.capacity).bind(input.capacity_unit)
+    .fetch_one(&db).await.map_err(internal_error)?;
+    Ok(Json(zone))
+}
+
+async fn delete_zone(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteZoneQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let result = sqlx::query("DELETE FROM warehouse_zones WHERE id = $1 AND warehouse_id = $2")
+        .bind(&query.id)
+        .bind(&query.warehouse_id)
+        .execute(&db)
+        .await
+        .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "해당 구역을 찾을 수 없습니다.".to_string(),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({ "success": true, "deletedId": query.id }),
+    ))
+}
+
+async fn list_references(
+    State(state): State<AppState>,
+    Query(query): Query<ReferenceQuery>,
+) -> Result<Json<Vec<ItemReference>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let references = sqlx::query_as::<_, ItemReference>(
+        "SELECT id, warehouse_id, name, description, thumbnail, created_at FROM item_references WHERE warehouse_id = $1 ORDER BY created_at DESC",
+    ).bind(warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(references))
+}
+
+async fn create_reference(
+    State(state): State<AppState>,
+    Json(input): Json<CreateReference>,
+) -> Result<(StatusCode, Json<ItemReference>), (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    if input.image.is_empty() || input.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "이미지와 품목명은 필수입니다.".to_string(),
+        ));
+    }
+    if input.image.len() > 50_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "이미지는 압축 후 50,000자 이하여야 합니다.".to_string(),
+        ));
+    }
+    let reference = sqlx::query_as::<_, ItemReference>(
+        "INSERT INTO item_references (warehouse_id, name, description, thumbnail)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, warehouse_id, name, description, thumbnail, created_at",
+    )
+    .bind(input.warehouse_id)
+    .bind(input.name.trim())
+    .bind(input.description.unwrap_or_default())
+    .bind(input.image)
+    .fetch_one(&db)
+    .await
+    .map_err(internal_error)?;
+    Ok((StatusCode::CREATED, Json(reference)))
+}
+
+async fn delete_reference(
+    State(state): State<AppState>,
+    Query(query): Query<ReferenceQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let id = query
+        .id
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "id가 필요합니다.".to_string()))?;
+    let warehouse_id = query.warehouse_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "warehouseId가 필요합니다.".to_string(),
+        )
+    })?;
+    let result = sqlx::query("DELETE FROM item_references WHERE id = $1 AND warehouse_id = $2")
+        .bind(id)
+        .bind(warehouse_id)
+        .execute(&db)
+        .await
+        .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "학습 데이터를 찾을 수 없습니다.".to_string(),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({ "success": true, "deletedId": id }),
+    ))
+}
+
+async fn import_references(
+    State(state): State<AppState>,
+    Json(input): Json<ImportReferences>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    if input.items.is_empty() || input.items.len() > 500 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "한 번에 1~500개 레퍼런스를 가져올 수 있습니다.".to_string(),
+        ));
+    }
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let mut inserted = 0_usize;
+    for item in input.items {
+        if item.name.trim().is_empty() || item.image.is_empty() || item.image.len() > 50_000 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "품목명과 이미지가 필요하며 이미지당 최대 50,000자까지 등록할 수 있습니다."
+                    .to_string(),
+            ));
+        }
+        sqlx::query("INSERT INTO item_references (warehouse_id, name, description, thumbnail) VALUES ($1, $2, $3, $4)")
+            .bind(&input.warehouse_id).bind(item.name.trim()).bind(item.description.unwrap_or_default()).bind(item.image)
+            .execute(&mut *transaction).await.map_err(internal_error)?;
+        inserted += 1;
+    }
+    transaction.commit().await.map_err(internal_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "success": true, "imported": inserted })),
+    ))
+}
+
+async fn list_delivery(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<DeliveryRecord>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_scope = delivery_warehouse_scope(&user)?;
+    let rows = sqlx::query_as::<_, DeliveryRecord>(
+        "SELECT id, warehouse_id, invoice_no, carrier_code, carrier_name, item_name, sender_name, receiver_name, status, status_code, current_location, delivered_at, tracking_details, created_at, updated_at
+         FROM delivery_tracking WHERE ($1::text IS NULL OR warehouse_id = $1) AND (delivered_at IS NULL OR delivered_at > now() - interval '24 hours') ORDER BY created_at DESC",
+    ).bind(warehouse_scope).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+fn delivery_warehouse_scope(
+    user: &AuthenticatedUser,
+) -> Result<Option<String>, (StatusCode, String)> {
+    if user.role == "서버 관리자" {
+        Ok(None)
+    } else {
+        user.warehouse_id.clone().map(Some).ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "계정에 배정된 창고가 없습니다.".to_string(),
+            )
+        })
+    }
+}
+
+async fn create_delivery(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<CreateDelivery>,
+) -> Result<(StatusCode, Json<DeliveryRecord>), (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let invoice = input
+        .invoice_no
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if invoice.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "운송장 번호를 입력해주세요.".to_string(),
+        ));
+    }
+    let warehouse_id = if user.role == "서버 관리자" {
+        input
+            .warehouse_id
+            .unwrap_or_else(|| "wh_wjmals".to_string())
+    } else {
+        user.warehouse_id.ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "계정에 배정된 창고가 없습니다.".to_string(),
+            )
+        })?
+    };
+    let row = sqlx::query_as::<_, DeliveryRecord>(
+        "INSERT INTO delivery_tracking (warehouse_id, invoice_no, carrier_code, carrier_name, item_name, sender_name, receiver_name, status, status_code, current_location)
+         VALUES ($1, $2, COALESCE($3, '04'), COALESCE($4, 'CJ대한통운'), COALESCE($5, '물류 출고건'), COALESCE($6, 'WMS 스마트 물류센터'), COALESCE($7, '고객님'), '상품인수', 'AT_PICKUP', '배송 접수처')
+         RETURNING id, warehouse_id, invoice_no, carrier_code, carrier_name, item_name, sender_name, receiver_name, status, status_code, current_location, delivered_at, tracking_details, created_at, updated_at",
+    ).bind(warehouse_id).bind(invoice).bind(input.carrier_code).bind(input.carrier_name).bind(input.item_name).bind(input.sender_name).bind(input.receiver_name)
+    .fetch_one(&db).await.map_err(internal_error)?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn delete_delivery(
+    State(state): State<AppState>,
+    Query(query): Query<DeliveryQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let id = query
+        .id
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "id가 필요합니다.".to_string()))?;
+    let warehouse_scope = delivery_warehouse_scope(&user)?;
+    let result = sqlx::query(
+        "DELETE FROM delivery_tracking WHERE id = $1 AND ($2::text IS NULL OR warehouse_id = $2)",
+    )
+    .bind(id)
+    .bind(warehouse_scope)
+    .execute(&db)
+    .await
+    .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "배송 항목을 찾을 수 없습니다.".to_string(),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+async fn advance_delivery(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(query): Json<DeliveryQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let id = query
+        .id
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "id가 필요합니다.".to_string()))?;
+    let warehouse_id = delivery_warehouse_scope(&user)?;
+    let current = sqlx::query_as::<_, (String, String)>("SELECT status_code, status FROM delivery_tracking WHERE id = $1 AND ($2::text IS NULL OR warehouse_id = $2)")
+        .bind(id).bind(&warehouse_id).fetch_optional(&db).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "배송 항목 없음".to_string()))?;
+    let (next_code, next_status, delivered) = next_delivery_state(&current.0).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "이미 배송 완료된 항목은 상태를 변경할 수 없습니다.".to_string(),
+        )
+    })?;
+    sqlx::query("UPDATE delivery_tracking SET status_code = $1, status = $2, current_location = $3, delivered_at = CASE WHEN $4 THEN now() ELSE NULL END, updated_at = now() WHERE id = $5 AND ($6::text IS NULL OR warehouse_id = $6)")
+        .bind(next_code).bind(next_status).bind(if delivered { "고객 지정장소 (문 앞 배송완료)" } else { "배송 이동 중" }).bind(delivered).bind(id).bind(warehouse_id)
+        .execute(&db).await.map_err(internal_error)?;
+    Ok(Json(
+        serde_json::json!({ "success": true, "status": next_status, "statusCode": next_code }),
+    ))
+}
+
+async fn track_delivery(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<TrackDeliveryInput>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = delivery_warehouse_scope(&user)?;
+    let delivery = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT carrier_code, invoice_no, warehouse_id FROM delivery_tracking WHERE id = $1 AND ($2::text IS NULL OR warehouse_id = $2)",
+    ).bind(input.id).bind(warehouse_id).fetch_optional(&db).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "배송 항목을 찾을 수 없습니다.".to_string()))?;
+
+    // 택배사 코드 → apis.tracker.delivery carrier ID 매핑
+    let carrier_id = match delivery.0.as_str() {
+        "01" => "kr.epost",
+        "04" => "kr.cjlogistics",
+        "05" => "kr.hanjin",
+        "06" => "kr.logen",
+        "08" => "kr.lotte",
+        "11" => "kr.ilyanglogis",
+        "23" => "kr.kdexp",
+        "22" => "kr.daesin",
+        "32" => "kr.hdexp",
+        "24" => "kr.cvsnet",
+        _ => "kr.cjlogistics",
+    };
+
+    let url = format!(
+        "https://apis.tracker.delivery/carriers/{}/tracks/{}",
+        carrier_id, delivery.1
+    );
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("배송 조회 연결 실패: {}", e),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("배송사 조회 실패 ({})", response.status()),
+        ));
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("응답 파싱 실패: {}", e)))?;
+
+    // apis.tracker.delivery 응답 파싱
+    let state_id = body
+        .get("state")
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let (status_code, is_delivered) = match state_id {
+        "delivered" => ("DELIVERED", true),
+        "out_for_delivery" => ("OUT_FOR_DELIVERY", false),
+        "at_pickup" | "information_received" => ("AT_PICKUP", false),
+        _ => ("IN_TRANSIT", false),
+    };
+    let status_label = body
+        .get("state")
+        .and_then(|s| s.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or(match status_code {
+            "DELIVERED" => "배송완료",
+            "OUT_FOR_DELIVERY" => "배달출발",
+            "AT_PICKUP" => "상품인수",
+            _ => "이동중",
+        })
+        .to_string();
+
+    let progresses = body
+        .get("progresses")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let details: Vec<Value> = progresses
+        .iter()
+        .map(|p| {
+            let time = p
+                .get("time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let location = p
+                .get("location")
+                .and_then(|l| l.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let kind = p
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    p.get("status")
+                        .and_then(|s| s.get("text"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({ "time": time, "where": location, "kind": kind })
+        })
+        .collect();
+
+    let current_location = details
+        .last()
+        .and_then(|d| d.get("where"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let kind = details
+                .last()
+                .and_then(|d| d.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if kind.is_empty() {
+                s.to_string()
+            } else {
+                format!("{} ({})", s, kind)
+            }
+        })
+        .unwrap_or_else(|| status_label.clone());
+
+    let details_json = Value::Array(details);
+    let result = sqlx::query("UPDATE delivery_tracking SET tracking_details = $1, current_location = $2, status = $3, status_code = $4, delivered_at = CASE WHEN $5 THEN COALESCE(delivered_at, now()) ELSE NULL END, updated_at = now() WHERE id = $6 AND warehouse_id = $7")
+        .bind(&details_json).bind(&current_location).bind(&status_label).bind(status_code).bind(is_delivered).bind(input.id).bind(&delivery.2)
+        .execute(&db).await.map_err(internal_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "배송 항목을 찾을 수 없습니다.".to_string(),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "status": status_label,
+        "statusCode": status_code,
+        "currentLocation": current_location,
+        "trackingDetails": details_json,
+        "updatedAt": Utc::now()
+    })))
+}
+
+fn calculate_zone_occupancy(
+    current_stock: Decimal,
+    capacity: Decimal,
+) -> (f64, &'static str, &'static str) {
+    let capacity = capacity.max(Decimal::ZERO);
+    let current_stock = current_stock.max(Decimal::ZERO);
+    let empty_ratio = if capacity.is_zero() {
+        if current_stock.is_zero() {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (1.0 - current_stock.to_f64().unwrap_or(0.0) / capacity.to_f64().unwrap_or(1.0))
+            .clamp(0.0, 1.0)
+    };
+    let (state, label) = if current_stock.is_zero() {
+        ("empty", "비어 있음")
+    } else if current_stock > capacity {
+        ("warning", "용량 초과")
+    } else {
+        ("normal", "정상")
+    };
+    (empty_ratio, state, label)
+}
+
+async fn list_monitor_logs(
+    State(state): State<AppState>,
+    Query(query): Query<ZoneQuery>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let warehouse_id = query
+        .warehouse_id
+        .unwrap_or_else(|| "wh_wjmals".to_string());
+    let rows = sqlx::query_as::<_, (Uuid, String, String, String, String, Decimal, String, i32, String, String, Option<String>, DateTime<Utc>)>(
+        "SELECT id, camera_url, item_name, status, status_label, estimated_quantity, unit, confidence, recommendation, reason, image_snapshot, analyzed_at
+         FROM monitor_logs WHERE warehouse_id = $1 ORDER BY analyzed_at DESC LIMIT 50",
+    ).bind(warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    let values = rows.into_iter().map(|row| serde_json::json!({
+        "id": row.0, "camera_url": row.1, "item_name": row.2, "status": row.3, "status_label": row.4,
+        "estimated_quantity": row.5, "unit": row.6, "confidence": row.7, "recommendation": row.8,
+        "reason": row.9, "image_snapshot": row.10, "analyzed_at": row.11
+    })).collect();
+    Ok(Json(values))
+}
+
+async fn analyze_monitor_image(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<MonitorInput>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let db = state.db.ok_or_else(database_not_configured)?;
+    if input.image.len() > 8_000_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "이미지 크기는 6MB 이하로 줄여 다시 시도하세요.".to_string(),
+        ));
+    }
+    let image = input.image.trim();
+    if image.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "분석할 이미지가 필요합니다.".to_string()));
+    }
+    let image_url = if let Some((metadata, _)) = image.split_once(',') {
+        if !metadata.starts_with("data:image/") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "JPEG, PNG 또는 WebP 이미지 형식만 분석할 수 있습니다.".to_string(),
+            ));
+        }
+        if !["data:image/jpeg;base64", "data:image/png;base64", "data:image/webp;base64"]
+            .contains(&metadata)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "JPEG, PNG 또는 WebP 이미지 형식만 분석할 수 있습니다.".to_string(),
+            ));
+        }
+        image.to_string()
+    } else {
+        format!("data:image/jpeg;base64,{}", image)
+    };
+    let api_key = env::var("GROQ_API_KEY").map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GROQ_API_KEY is not configured".to_string(),
+        )
+    })?;
+    let vision_model =
+        env::var("GROQ_VISION_MODEL").unwrap_or_else(|_| "qwen/qwen3.8-27b".to_string());
+    let warehouse_id = if user.role == "서버 관리자" {
+        input
+            .warehouse_id
+            .unwrap_or_else(|| "wh_wjmals".to_string())
+    } else {
+        user.warehouse_id.clone().ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "계정에 배정된 창고가 없습니다.".to_string(),
+            )
+        })?
+    };
+    let references = if let Some(item_name) = input.item_name.as_deref() {
+        let matching = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT name, description, thumbnail FROM item_references WHERE warehouse_id = $1 AND lower(name) = lower($2) ORDER BY created_at DESC LIMIT 3",
+        )
+        .bind(&warehouse_id)
+        .bind(item_name)
+        .fetch_all(&db)
+        .await
+        .map_err(internal_error)?;
+        if matching.is_empty() {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT name, description, thumbnail FROM item_references WHERE warehouse_id = $1 ORDER BY created_at DESC LIMIT 3",
+            )
+            .bind(&warehouse_id)
+            .fetch_all(&db)
+            .await
+            .map_err(internal_error)?
+        } else {
+            matching
+        }
+    } else {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT name, description, thumbnail FROM item_references WHERE warehouse_id = $1 ORDER BY created_at DESC LIMIT 3",
+        )
+        .bind(&warehouse_id)
+        .fetch_all(&db)
+        .await
+        .map_err(internal_error)?
+    };
+    let expected_unit = if let Some(item_name) = input.item_name.as_deref() {
+        sqlx::query_as::<_, (String, Option<String>)>("SELECT unit,package_unit FROM inventory_items WHERE warehouse_id=$1 AND lower(name)=lower($2) AND archived_at IS NULL ORDER BY created_at DESC LIMIT 1")
+            .bind(&warehouse_id).bind(item_name).fetch_optional(&db).await.map_err(internal_error)?
+    } else {
+        None
+    };
+    let unit_instruction = expected_unit.as_ref().map(|(unit, package_unit)| format!(
+        "기존 재고 품목 단위 제약: 기준 단위는 '{}', 등록된 포장 단위는 '{}'. 이미지에서 수량을 판독할 수 있더라도 unit 필드에는 이 둘 중 하나만 반환하세요. 해당 단위로 신뢰성 있게 환산할 수 없으면 추정 수량을 억지로 만들지 말고 낮은 confidence와 사유를 반환하세요.",
+        unit, package_unit.as_deref().unwrap_or("없음")
+    )).unwrap_or_else(|| "단위는 이미지에서 확인 가능한 명확한 단위를 사용하세요.".to_string());
+    let prompt = format!("당신은 창고 실물 사진을 정형 데이터로 변환하는 비전 분석기입니다. 이미지에서 실제로 보이는 내용만 분석하고 아래 JSON 객체 하나만 반환하세요. 제공된 레퍼런스는 품목 식별 참고이며 현재 이미지의 관찰 결과와 혼합하지 마세요. 우선 품목: {}. {} JSON 필드는 itemName(품목명), estimatedQuantity(0 이상 추정 수량), unit, status(shortage|safe|overstock), statusLabel, confidence(0~100 정수), recommendation, reason, visualFeatures 객체입니다. visualFeatures에는 objects(식별한 물체/포장 종류와 보이는 개수 문자열 배열), colors(주요 색상 배열), shapesAndEdges(형태·모서리·배치 특징 배열), text(읽을 수 있는 문자·숫자·라벨 배열, 불확실하면 빈 배열), logos(식별 가능한 로고/브랜드 배열, 불확실하면 빈 배열), description(장면 설명), quantityBasis(수량 추정에 사용한 근거와 가림/중첩 등 한계)를 넣으세요. 사진만으로 수량을 신뢰성 있게 셀 수 없으면 임의로 단정하지 말고 confidence를 낮추고 quantityBasis와 reason에 한계를 적으세요. 사진 추정은 실측이 아니므로 승인 전 재고에 반영하지 마세요.", input.item_name.as_deref().unwrap_or("없음"), unit_instruction);
+    let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for (name, description, thumbnail) in references {
+        if thumbnail.trim().is_empty() {
+            continue;
+        }
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": format!("레퍼런스 품목: {}\n설명: {}", name, description),
+        }));
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": thumbnail },
+        }));
+    }
+    content.push(serde_json::json!({
+        "type": "text",
+        "text": "이제 분석할 현재 카메라 이미지입니다.",
+    }));
+    content.push(serde_json::json!({
+        "type": "image_url",
+        "image_url": { "url": image_url },
+    }));
+    let payload = serde_json::json!({
+        "model": vision_model,
+        "messages": [{ "role": "user", "content": content }],
+        "max_tokens": 512,
+        "temperature": 0.1
+    });
+    let response = reqwest::Client::new()
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let details = response.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Groq model '{}' returned {}: {}",
+                vision_model,
+                status,
+                details.chars().take(300).collect::<String>()
+            ),
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    let json_text = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let result: AnalysisResult = serde_json::from_str(json_text).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("AI response JSON parse failed: {}", error),
+        )
+    })?;
+    if result.estimated_quantity < Decimal::ZERO {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "AI returned a negative quantity".to_string(),
+        ));
+    }
+    if !(0..=100).contains(&result.confidence) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "AI returned an invalid confidence score".to_string(),
+        ));
+    }
+    sqlx::query("INSERT INTO monitor_logs (warehouse_id, camera_url, item_name, status, status_label, estimated_quantity, unit, confidence, recommendation, reason, image_snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+        .bind(&warehouse_id).bind(input.camera_url.unwrap_or_else(|| "webcam".to_string())).bind(&result.item_name).bind(&result.status).bind(&result.status_label).bind(result.estimated_quantity).bind(&result.unit).bind(result.confidence).bind(&result.recommendation).bind(&result.reason).bind(image.chars().take(1000).collect::<String>())
+        .execute(&db).await.map_err(internal_error)?;
+    let item_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM inventory_items WHERE warehouse_id=$1 AND lower(name)=lower($2) AND archived_at IS NULL ORDER BY created_at DESC LIMIT 1")
+        .bind(&warehouse_id).bind(&result.item_name).fetch_optional(&db).await.map_err(internal_error)?;
+    let estimate_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO inventory_vision_estimates (id,warehouse_id,inventory_item_id,item_name,estimated_quantity,unit,confidence,recommendation,reason,visual_features,image_snapshot,submitted_by,submitted_email) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
+        .bind(estimate_id).bind(&warehouse_id).bind(item_id).bind(&result.item_name).bind(result.estimated_quantity).bind(&result.unit).bind(result.confidence).bind(&result.recommendation).bind(&result.reason).bind(serde_json::to_value(&result.visual_features).map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?).bind(image).bind(&user.id).bind(&user.email)
+        .execute(&db).await.map_err(internal_error)?;
+    Ok(Json(
+        serde_json::json!({ "estimateId":estimate_id,"itemName":result.item_name,"estimatedQuantity":result.estimated_quantity,"unit":result.unit,"status":result.status,"statusLabel":result.status_label,"confidence":result.confidence,"recommendation":result.recommendation,"reason":result.reason,"visualFeatures":result.visual_features,"model":vision_model,"reviewStatus":"PENDING","savedToDb":false }),
+    ))
+}
+
+async fn list_vision_estimates(
+    State(state): State<AppState>,
+    Query(query): Query<VisionEstimateQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let warehouse_id = if user.role == "서버 관리자" {
+        query.warehouse_id
+    } else {
+        user.warehouse_id
+    };
+    let warehouse_id = warehouse_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "warehouseId is required".to_string(),
+        )
+    })?;
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, Decimal, String, i32, String, String, String, DateTime<Utc>, Value)>(
+        "SELECT id,inventory_item_id,item_name,estimated_quantity,unit,confidence,recommendation,reason,submitted_email,created_at,visual_features FROM inventory_vision_estimates WHERE warehouse_id=$1 AND status='PENDING' ORDER BY created_at DESC LIMIT 100",
+    ).bind(warehouse_id).fetch_all(&db).await.map_err(internal_error)?;
+    Ok(Json(rows.into_iter().map(|row| serde_json::json!({"id":row.0,"inventoryItemId":row.1,"itemName":row.2,"estimatedQuantity":row.3,"unit":row.4,"confidence":row.5,"recommendation":row.6,"reason":row.7,"submittedEmail":row.8,"createdAt":row.9,"visualFeatures":row.10})).collect()))
+}
+
+async fn get_vision_estimate(
+    State(state): State<AppState>,
+    Query(query): Query<VisionEstimateQuery>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let id = query.id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "id is required".to_string(),
+        )
+    })?;
+    let warehouse_id = if user.role == "서버 관리자" {
+        query.warehouse_id
+    } else {
+        user.warehouse_id
+    }
+    .ok_or_else(|| (StatusCode::BAD_REQUEST, "warehouseId is required".to_string()))?;
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, Decimal, String, i32, String, String, String, DateTime<Utc>, Value, Option<String>)>(
+        "SELECT id,inventory_item_id,item_name,estimated_quantity,unit,confidence,recommendation,reason,submitted_email,created_at,visual_features,image_snapshot FROM inventory_vision_estimates WHERE id=$1 AND warehouse_id=$2",
+    )
+    .bind(id)
+    .bind(warehouse_id)
+    .fetch_optional(&db)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "비전 분석 결과를 찾을 수 없습니다.".to_string()))?;
+    Ok(Json(serde_json::json!({
+        "id":row.0,"inventoryItemId":row.1,"itemName":row.2,"estimatedQuantity":row.3,
+        "unit":row.4,"confidence":row.5,"recommendation":row.6,"reason":row.7,
+        "submittedEmail":row.8,"createdAt":row.9,"visualFeatures":row.10,"imageSnapshot":row.11
+    })))
+}
+
+async fn review_vision_estimate(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    Json(input): Json<ReviewVisionEstimate>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if user.role != "관리자" && user.role != "서버 관리자" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "관리자만 비전 추정치를 검토할 수 있습니다.".to_string(),
+        ));
+    }
+    let db = state.db.ok_or_else(database_not_configured)?;
+    let mut transaction = db.begin().await.map_err(internal_error)?;
+    let estimate = sqlx::query_as::<_, (String, Option<Uuid>, String, Decimal, String, i32, String)>("SELECT warehouse_id,inventory_item_id,item_name,estimated_quantity,unit,confidence,reason FROM inventory_vision_estimates WHERE id=$1 AND status='PENDING' FOR UPDATE")
+        .bind(input.id).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "검토 대기 비전 추정치를 찾을 수 없습니다.".to_string()))?;
+    if user.role != "서버 관리자" && user.warehouse_id.as_deref() != Some(estimate.0.as_str())
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "다른 창고의 추정치는 검토할 수 없습니다.".to_string(),
+        ));
+    }
+    let note = input
+        .note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(if input.approve {
+            "관리자 승인"
+        } else {
+            "관리자 반려"
+        });
+    if input.approve {
+        let item_id = input.inventory_item_id.or(estimate.1).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "승인할 재고 품목을 선택해야 합니다.".to_string(),
+            )
+        })?;
+        let item = sqlx::query_as::<_, (String, Decimal, Decimal, String, Option<String>, Decimal, Option<String>, Decimal)>("SELECT name,current,safe,unit,package_unit,package_size,pallet_unit,pallet_size FROM inventory_items WHERE id=$1 AND warehouse_id=$2 AND archived_at IS NULL FOR UPDATE")
+            .bind(item_id).bind(&estimate.0).fetch_optional(&mut *transaction).await.map_err(internal_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "활성 재고 품목을 찾을 수 없습니다.".to_string()))?;
+        let quantity = estimate.3
+            * unit_multiplier(
+                &estimate.4,
+                &item.3,
+                item.4.as_deref(),
+                item.5,
+                item.6.as_deref(),
+                item.7,
+            )
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "비전 단위가 품목의 기준/포장/파렛 단위와 일치하지 않습니다.".to_string(),
+                )
+            })?;
+        let (status, status_label, diff_text, recommendation) =
+            classify_stock(quantity, item.2, &item.3);
+        sqlx::query("UPDATE inventory_items SET current=$1,status=$2,status_label=$3,diff_text=$4,recommendation=$5,updated_at=now() WHERE id=$6")
+            .bind(quantity).bind(status).bind(status_label).bind(diff_text).bind(recommendation).bind(item_id).execute(&mut *transaction).await.map_err(internal_error)?;
+        let delta = quantity - item.1;
+        if !delta.is_zero() {
+            sqlx::query("INSERT INTO inventory_movements (warehouse_id,inventory_item_id,item_name,movement_type,quantity_delta,balance_after,note,source,actor_id,actor_email) VALUES ($1,$2,$3,'vision_estimate',$4,$5,$6,'groq_vision_approved',$7,$8)")
+                .bind(&estimate.0).bind(item_id).bind(&item.0).bind(delta).bind(quantity).bind(format!("AI 신뢰도 {}%, 검토자 사유: {}. 분석 근거: {}",estimate.5,note,estimate.6)).bind(&user.id).bind(&user.email).execute(&mut *transaction).await.map_err(internal_error)?;
+        }
+        sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,before_data,after_data,reason,source) VALUES ($1,$2,$3,'approve','vision_estimate',$4,$5,$6,$7,'groq_vision')")
+            .bind(&estimate.0).bind(&user.id).bind(&user.email).bind(input.id.to_string())
+            .bind(serde_json::json!({"current":item.1,"inventoryItemId":item_id}))
+            .bind(serde_json::json!({"current":quantity,"delta":delta,"confidence":estimate.5})).bind(note).execute(&mut *transaction).await.map_err(internal_error)?;
+    } else {
+        sqlx::query("INSERT INTO inventory_audit_events (warehouse_id,actor_id,actor_email,action,entity_type,entity_id,after_data,reason,source) VALUES ($1,$2,$3,'reject','vision_estimate',$4,$5,$6,'groq_vision')")
+            .bind(&estimate.0).bind(&user.id).bind(&user.email).bind(input.id.to_string()).bind(serde_json::json!({"itemName":estimate.2,"estimatedQuantity":estimate.3,"unit":estimate.4})).bind(note).execute(&mut *transaction).await.map_err(internal_error)?;
+    }
+    let status = if input.approve {
+        "APPROVED"
+    } else {
+        "REJECTED"
+    };
+    sqlx::query("UPDATE inventory_vision_estimates SET inventory_item_id=COALESCE($1,inventory_item_id),status=$2,reviewed_by=$3,reviewed_email=$4,reviewed_at=now(),review_note=$5 WHERE id=$6")
+        .bind(input.inventory_item_id.or(estimate.1)).bind(status).bind(&user.id).bind(&user.email).bind(note).bind(input.id).execute(&mut *transaction).await.map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    Ok(Json(
+        serde_json::json!({"success":true,"status":status,"estimateId":input.id}),
+    ))
+}
+
+fn create_session_token(
+    state: &AppState,
+    id: &str,
+    email: &str,
+    role: &str,
+    status: &str,
+    warehouse_id: Option<String>,
+) -> Result<String, (StatusCode, String)> {
+    let claims = SessionClaims {
+        sub: id.to_string(),
+        email: email.to_string(),
+        role: role.to_string(),
+        status: status.to_string(),
+        warehouse_id,
+        exp: (Utc::now().timestamp() + 12 * 60 * 60) as usize,
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "세션 토큰 생성에 실패했습니다.".to_string(),
+        )
+    })
+}
+
+fn required(value: Option<String>, name: &str) -> Result<String, (StatusCode, String)> {
+    value
+        .filter(|item| !item.trim().is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("{} is required", name)))
+}

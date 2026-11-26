@@ -1,0 +1,16 @@
+FROM rust:bookworm AS builder
+WORKDIR /app
+COPY rust-backend/Cargo.toml rust-backend/Cargo.lock ./
+COPY rust-backend/schema.sql ./
+COPY rust-backend/src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/target/release/wms-api /usr/local/bin/wms-api
+ENV PORT=8080
+EXPOSE 8080
+CMD ["/usr/local/bin/wms-api"]

@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: wms-rust-api
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOW_EMPTY_DATABASE
+        value: "true"
+      - key: JWT_SECRET
+        sync: false
+      - key: SUPER_ADMIN_PASSWORD
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_VISION_MODEL
+        value: qwen/qwen3.8-27b

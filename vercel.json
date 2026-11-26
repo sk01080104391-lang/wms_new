@@ -1,0 +1,5 @@
+{
+  "buildCommand": "if [ -f frontend/package.json ]; then cd frontend; fi && npm run build",
+  "installCommand": "if [ -f frontend/package.json ]; then cd frontend; fi && npm install --ignore-scripts",
+  "framework": "nextjs"
+}
